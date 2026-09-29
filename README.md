@@ -126,6 +126,11 @@ python custom_nodes/CurveAttention/tools/run_gpu_tests.py --allow-gpu
 
 Passing either is not a speed or quality measurement.
 
+## License
+
+[Apache 2.0](LICENSE). ComfyUI core is GPL-3.0; this is a separate plugin, not
+a derivative of it.
+
 ## Notes
 
 - [Cache speed modes](docs/cache-speed.md) — spans, modes, guards, telemetry.
