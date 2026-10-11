@@ -18,6 +18,6 @@ sys.argv = [sys.argv[0]]
 from comfy.cli_args import args
 args.cpu = False
 suite = unittest.TestLoader().loadTestsFromNames(
-    options.selectors or ["test_attention.NativeOperatorTests"])
+    options.selectors or ["test_sparse.NativeOperatorTests"])
 result = unittest.TextTestRunner(verbosity=2).run(suite)
 raise SystemExit(0 if result.wasSuccessful() and not result.skipped and result.testsRun else 1)

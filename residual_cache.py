@@ -22,7 +22,7 @@ def fingerprint(x, segments):
     result = []
     for start, end, kind in segments:
         if end <= start:
-            raise ValueError("CurveAttention: empty cache segment")
+            raise ValueError("CurveAttn Cache: empty cache segment")
         rows = torch.linspace(start, end - 1, min(32, end - start),
                               device=x.device).long()
         cols = torch.linspace(0, x.shape[1] - 1, min(32, x.shape[1]),
@@ -97,7 +97,7 @@ def format_cache_report(cache, **meta) -> str:
     else:
         drift_s = f"{max_drift:.4g}"
     return (
-        f"CurveAttention cache: hits={cache.hits} refreshes={cache.refreshes} "
+        f"CurveAttn cache: hits={cache.hits} refreshes={cache.refreshes} "
         f"bypasses={cache.bypasses} budget_bypasses={cache.budget_bypasses} "
         f"bytes={cache.bytes} span={span} mode={mode} "
         f"start={float(start):.2f} end={float(end):.2f} max_drift={drift_s}"
@@ -112,9 +112,9 @@ class MiddleCache:
         self.max_hits = max_hits
         self.max_bytes = max_bytes
         if span not in ("middle", "whole"):
-            raise ValueError("CurveAttention: invalid cache span")
+            raise ValueError("CurveAttn Cache: invalid cache span")
         if mode not in ("fingerprint", "first_block"):
-            raise ValueError("CurveAttention: invalid cache mode")
+            raise ValueError("CurveAttn Cache: invalid cache mode")
         self.span = span
         self.start_percent = float(start_percent)
         self.end_percent = float(end_percent)
@@ -224,8 +224,10 @@ class MiddleCache:
         first, last = (0, count - 1) if self.span == "whole" else (1, count - 2)
         try:
             if index == first:
+                # meta may be a callable so it is computed lazily, at the
+                # first span block, after every step wrapper has published.
                 with pause_malloc_graph():
-                    self._begin(args, meta)
+                    self._begin(args, meta() if callable(meta) else meta)
             if first <= index <= last and self.active is not None:
                 mode, entry = self.active
                 if mode == "hit":

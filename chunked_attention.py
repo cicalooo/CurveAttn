@@ -1,13 +1,20 @@
+"""qkv_mode=chunked: stream QKV projection chunks into ck.sol_attn_chunked.
+
+Works on any object with SparseState's interface (resolve, sparse_kwargs,
+chunked_stats, counters); it does not import the sparse module.
+"""
 from __future__ import annotations
 
 import torch
 import comfy_kitchen as ck
 from comfy.model_management import cast_to
 
+from .common import h3_sinks
+
 
 def projection_chunks(attention, x, chunk_tokens=2048):
     if chunk_tokens <= 0 or chunk_tokens % 64:
-        raise ValueError("CurveAttention: chunk_tokens must be positive and 64-aligned")
+        raise ValueError("CurveAttn: chunk_tokens must be positive and 64-aligned")
 
     def factory():
         for start in range(0, x.shape[0], chunk_tokens):
@@ -17,8 +24,6 @@ def projection_chunks(attention, x, chunk_tokens=2048):
 
 
 def chunked_reason(attention, x, rope_freqs, state, options):
-    if options.get("_curve_dense"):
-        return "scheduled dense"
     if "multigpu_thread_device" in options:
         return "multigpu unsupported"
     if x.device.type != "cuda":
@@ -60,28 +65,30 @@ def run_chunked(attention, x, rope_freqs, options, *, kernel=None, cast=None,
 
 
 def make_chunked_attention(attention, state, index=0):
-    from .curve_attention import h3_sinks, _sparse_options
-
     def call(x, rope_freqs=None, transformer_options=None):
         options = transformer_options or {}
-        reason = chunked_reason(attention, x, rope_freqs, state, options)
+        decision, reason, _ = state.resolve(options)
+        if decision is None:
+            reason = reason or "not this node's sparse step"
+        else:
+            reason = chunked_reason(attention, x, rope_freqs, state, options)
         sinks = h3_sinks(options, x.shape[0], state.protect_audio, state.protect_prefix)
         if sinks is None:
             reason = reason or "layout unavailable for protection"
         if reason is not None:
             state.log_once(("chunked_fallback", reason), "chunked bypass: " + reason)
+            # Native attention goes through the override chain as usual.
             return attention(x, rope_freqs=rope_freqs, transformer_options=options)
-        sparse_options = _sparse_options(state, None, sinks[0], sinks[1])
-        run = state.run_scope.current() if state.run_scope is not None else None
-        prev = run.chunked.get(index, (None, None)) if run is not None else (None, None)
+        sparse_options = state.sparse_kwargs(None, sinks[0], sinks[1], decision)
+        stats = state.chunked_stats
+        prev = stats.get(index, (None, None))
 
         def keep(kmean_next, vscale_next):
-            if run is not None and kmean_next is not None:
-                run.chunked[index] = (kmean_next, vscale_next)
+            if kmean_next is not None:
+                stats[index] = (kmean_next, vscale_next)
 
-        result = run_chunked(
-            attention, x, rope_freqs, sparse_options,
-            kmean=prev[0], vscale=prev[1], on_stats=keep)
+        result = run_chunked(attention, x, rope_freqs, sparse_options,
+                             kmean=prev[0], vscale=prev[1], on_stats=keep)
         state.chunked_calls += 1
         state.sparse_calls += 1
         state.log_once(("chunked", index), f"selector=chunked block={index}")

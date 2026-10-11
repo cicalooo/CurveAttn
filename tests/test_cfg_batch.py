@@ -9,7 +9,7 @@ from comfy.conds import CONDRegular
 from comfy.model_base import BaseModel
 from comfy.patcher_extension import WrapperExecutor
 from comfy.samplers import _calc_cond_batch
-from curve_test_package.runtime import limit_h3_cond_batch
+from curvattn_test_package.common import limit_h3_cond_batch
 
 
 class _Patcher:

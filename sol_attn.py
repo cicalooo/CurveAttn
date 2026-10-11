@@ -1,4 +1,4 @@
-"""Prepared SLA integration and the unchanged native sparse fallback."""
+"""Kitchen sol_attn entry points: prepared (owned BF16) and native zero-copy."""
 
 from __future__ import annotations
 

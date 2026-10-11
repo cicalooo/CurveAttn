@@ -34,9 +34,8 @@ selectors = sys.argv[1:]
 sys.argv = [sys.argv[0]]
 from comfy.cli_args import args
 args.cpu = True
-package = types.ModuleType("curve_test_package")
+package = types.ModuleType("curvattn_test_package")
 package.__path__ = [str(ROOT)]
-package.__version__ = "2.5"
 sys.modules[package.__name__] = package
 loader = unittest.TestLoader()
 suite = (loader.loadTestsFromNames(selectors) if selectors else

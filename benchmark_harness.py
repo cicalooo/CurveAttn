@@ -61,12 +61,11 @@ def load_modules():
     sys.path.insert(0, str(root.parents[1]))
     from comfy.cli_args import args
     args.cpu = False
-    name = "curve_benchmark_package"
+    name = "curvattn_benchmark_package"
     package = types.ModuleType(name)
     package.__path__ = [str(root)]
-    package.__version__ = "2.3"
     sys.modules[name] = package
-    return (importlib.import_module(name + ".curve_attention"),
+    return (importlib.import_module(name + ".sparse"),
             importlib.import_module(name + ".chunked_attention"))
 
 
@@ -85,9 +84,9 @@ def run(args):
                      device=torch.device("cuda"), operations=operations).eval()
     cases = [("dense_pytorch", "pytorch", "native", True),
              ("dense_kitchen", "comfy_kitchen_int8", "native", True),
-             ("curve_native", "pytorch", "native", False),
-             ("curve_owned", "pytorch", "owned_bf16", False),
-             ("curve_chunked_current_stats", "pytorch", "chunked", False)]
+             ("curvattn_native", "pytorch", "native", False),
+             ("curvattn_owned", "pytorch", "owned_bf16", False),
+             ("curvattn_chunked_current_stats", "pytorch", "chunked", False)]
     with torch.inference_mode():
         for seq in args.seq:
             x = torch.randn(seq, 128, device="cuda", dtype=torch.bfloat16)
@@ -98,12 +97,13 @@ def run(args):
                 backend = ca.get_attention_function(backend_name, None)
                 if backend is None:
                     raise RuntimeError("requested dense backend missing: " + backend_name)
-                state = ca.CurveAttnState(
-                    keep_ratio=.2, min_tokens=0, dense_steps=frozenset(),
-                    dense_last_steps=0, tail=False, protect_audio=False, verbose=False,
-                    dense_attention=backend, prepared_available=mode == "owned_bf16",
+                state = ca.SparseState(
+                    dense_attention=backend, keep_ratio=.2, min_tokens=0,
+                    prepared_available=mode == "owned_bf16",
                     dense_backend=backend_name, qkv_mode=mode)
-                options = {"_curve_dense": force_dense}
+                decision = ca.StepDecision(force_dense, "benchmark dense" if force_dense else None,
+                                           state.keep_ratio, state.tau)
+                options = ca.publish({}, state, decision)
                 ca.install_override(state, options)
                 target = ch.make_chunked_attention(attn, state) if mode == "chunked" else attn
 
@@ -147,7 +147,7 @@ def run(args):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Explicitly authorized synthetic CurveAttention benchmark")
+    parser = argparse.ArgumentParser(description="Explicitly authorized synthetic CurveAttn benchmark")
     parser.add_argument("--allow-gpu", action="store_true")
     parser.add_argument("--seq", type=int, nargs="+", default=[65, 257, 4096])
     parser.add_argument("--heads", type=int, default=56)

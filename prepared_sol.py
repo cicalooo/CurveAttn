@@ -1,4 +1,4 @@
-"""CurveAttention-owned prepare/consume layer over stock Kitchen sol_attn.
+"""CurveAttn-owned prepare/consume layer over stock Kitchen sol_attn.
 
 selector is owned_bf16. Stock Kitchen has no comfy_kitchen.sol_prepared.
 """

@@ -1,6 +1,5 @@
 import ast
 from pathlib import Path
-import types
 import unittest
 import torch
 
@@ -31,14 +30,11 @@ class CoreContractTests(unittest.TestCase):
     @torch.no_grad()
     def test_native_block_passthrough(self):
         from comfy.ldm.minimax.model import DiTBlock
-        from curve_test_package.block_dispatch import make_block_dispatch
-        from curve_test_package.runtime import RunScope
+        from curvattn_test_package.blocks import CurveBlockDispatch
         torch.manual_seed(7321)
         block = DiTBlock(hidden=256, heads=2, head_dim=128, ffn=128, t_dim=4,
                          eps=1e-6, qk_eps=1e-6, dtype=torch.float32,
                          device=torch.device("cpu"), operations=torch.nn).eval()
-        state = types.SimpleNamespace(qkv_mode="native", cache_enabled=False,
-                                      run_scope=RunScope(.01, 1, 1))
         x = torch.randn(6, 256)
         t = torch.randn(1, 4)
         segments = [(0, 2, 1), (2, 4, 2), (4, 6, 0)]
@@ -51,6 +47,6 @@ class CoreContractTests(unittest.TestCase):
                                  a["rope_freqs"], transformer_options=a["transformer_options"],
                                  attention=a.get("attention"))}
 
-        actual = make_block_dispatch(0, 3, block.attn, state)(
+        actual = CurveBlockDispatch(0, 3, block.attn)(
             args, {"original_block": original})["img"]
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)

@@ -1,7 +1,7 @@
 import types
 import unittest
 import torch
-from curve_test_package.residual_cache import MiddleCache
+from curvattn_test_package.residual_cache import MiddleCache
 
 
 class CacheTests(unittest.TestCase):

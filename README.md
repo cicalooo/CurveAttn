@@ -1,137 +1,128 @@
-# CurveAttention
+# CurveAttn
 
-MiniMax H3 sparse attention for ComfyUI, running on stock Comfy Kitchen
-`ck.sol_attn`, with an optional experimental residual cache.
+MiniMax H3 sparse attention and an experimental residual cache for ComfyUI,
+as two independent V3 nodes. Sparse attention runs on the stock Comfy Kitchen
+`ck.sol_attn` kernel; the cache needs no special kernel at all.
 
-Version 2.5.
+Version 3.0.0. This is a clean break from CurveAttention 2.x: the old
+`CurveAttention` node, its widget layout and its legacy cache preset names
+are gone, and workflows using it must be rebuilt with the nodes below.
 
 ## Requirements
 
-- ComfyUI 0.32.0 or newer
-- A CUDA GPU with a compiled Comfy Kitchen `sol_attn` kernel
-  (`comfy-kitchen` 0.2.35 or newer)
-- A MiniMax H3 model
+- ComfyUI with the V3 node API (`comfy_api.latest`, `io.DynamicCombo`) and
+  MiniMax H3 support.
+- **CurveAttn Sparse:** Comfy Kitchen with a compiled `sol_attn` kernel for your
+  GPU (CUDA). `qkv_mode=chunked` additionally needs `ck.sol_attn_chunked`.
+- **CurveAttn Residual Cache:** any MiniMax H3 model; works on a plain dense model.
 
-Nothing else is supported. The node checks the model type and the Kitchen
-kernel and refuses to load otherwise. No weights and no core forward
-implementation are replaced: FFN, AdaLN, LoRA and the sampler stay in ComfyUI.
+## Nodes
 
-## Install
+Both live in `model/patch/CurveAttn`, take `MODEL` and return a patched `MODEL`.
+Neither changes weights or the core forward.
 
-Clone into `custom_nodes`:
+### CurveAttn Sparse (`CurveAttnSparse`)
 
-```bash
-cd ComfyUI/custom_nodes
-git clone https://github.com/cicalooo/CurveAttention.git CurveAttention
-```
+| Input | Default | Meaning |
+|---|---|---|
+| Selection | `sla` | `sla`: fixed top-k key blocks. `sol-attn`: adaptive tau threshold. Same kernel. |
+| ↳ sla: Keep % / Keep % end | 20 / -1 | Percent of key blocks each query keeps; optional linear schedule toward *end* over the run (-1 off). |
+| ↳ sol-attn: Tau / Tau end | 1.3 / -1 | Threshold (higher is sparser); optional schedule (-1 off). |
+| Min tokens | 12288 | Shorter sequences stay dense. |
+| Dense steps | `1` | 0-based steps that always run dense (`1`, `0-1`, `0,2`). |
+| Dense last steps | 0 | Force the last N steps dense. |
+| Sparse start / end | 0 / 1 | Sampling-progress window where sparse is allowed. |
+| Protect audio | off | Keep target-audio query rows dense. Does **not** affect the cache. |
+| Protect prefix *(advanced)* | off | Keep all key blocks before target video exact. |
+| Extra tokens *(advanced)* | 0 | Extra top-scoring tokens (multiple of 64). |
+| Tail *(advanced)* | off | Pooled-tail correction. |
+| Disable FP16 accum *(advanced)* | on | Full-precision matmul reductions during steps (restored after). |
+| Dense backend *(advanced)* | `comfy_kitchen_int8` | Dense fallback when nothing CurveAttn-compatible sits below. |
+| QKV mode *(advanced)* | `native` | `native` aligned views, `owned_bf16` prepared copies, `chunked` streamed projection. |
+| Verbose *(advanced)* | off | Log sparse/dense decisions once per shape. |
 
-Restart ComfyUI. One node is added, **CurveAttention**, in `model/patch/unet`.
+### CurveAttn Residual Cache (`CurveAttnCache`)
 
-## Usage
+In the graph means on; bypass the node to turn it off.
 
-Wire the loader `MODEL` into CurveAttention, and CurveAttention `MODEL` into
-the sampler. Defaults are conservative: SLA top-k at 20% keep, full dense for
-sequences under 12288 tokens, and the residual cache off.
+| Input | Default | Meaning |
+|---|---|---|
+| Preset | `manual` | `manual` shows every knob below. `turbo_safe`, `native`, `fast` are unvalidated starting points (no extra widgets). |
+| ↳ Threshold | 0.01 | Max sampled drift vs the last fresh step. 0 disables reuse. Not an error bound. |
+| ↳ Max hits | 1 | Consecutive reuses before a fresh stack (1–2). |
+| ↳ Span | `middle` | `middle` keeps first/last blocks fresh; `whole` skips every block on a hit. |
+| ↳ Cache start / end | 0.2 / 0.8 | Step-progress window where reuse may happen. |
+| ↳ Min steps | 6 | Shortest schedule that may hit. |
+| ↳ Temporal guard | off | Also bound the worst video row-chunk drift. |
+| ↳ Audio guard | off | Refuse a hit if audio drifted (keeps the store). |
+| ↳ Mode | `fingerprint` | `fingerprint` samples T/A/V drift; `first_block` uses the span-input delta. |
+| Max MiB | 1024 | Residual budget across at most two CFG branches. Presets never set it. |
 
-Widgets are grouped into collapsible sections — SLA, Protect, Sol-Attn,
-Backend, Cache. Closing a section does not silently change what is armed;
-the Protect and Sol-Attn sections reset their own optional knobs, and closing
-Cache forces the cache off.
+Preset values: `turbo_safe` threshold 0.05, window 0.15–0.85, min steps 4,
+audio guard. `native` 0.08, 0.15–0.85, temporal+audio guard. `fast` 0.10,
+0.10–0.90, temporal+audio guard.
 
-Every run logs a line at patch time and a summary at the end. The one to watch
-is the cache line: `CurveAttention cache: hits=0` means the cache did no work.
+The cache is skipped (and logged once) for masked/inpaint runs, references or
+keyframes, multi-GPU, batched CFG branches, sigmas that do not match the
+schedule, and schedules shorter than Min steps. Both nodes split CFG into one
+branch per call because H3 rejects batch > 1.
 
-## What it does
+## Stacking and order
 
-- **Sparse path** is Comfy Kitchen Sol, either `sla` (fixed keep %) or
-  `sol-attn` (adaptive tau threshold, ignores keep %).
-- **QKV mode** — `native` keeps aligned views, `owned_bf16` copies Q/K/V only
-  when the tensor does not already own its storage, `chunked` streams last-step
-  stats. Chunked is experimental: the first call of a run may project twice, and
-  later steps reuse the previous `kmean` / `vscale`.
-- **CFG branches run one at a time.** H3 rejects batch > 1, so a batched
-  cond+uncond call crashes before any block runs. Splitting the branches is what
-  lets the residual cache see each one.
-- **Residual cache** reuses transformer-block residuals between steps. It is
-  experimental, off by default, and only helps when it actually hits.
+Wire `loader → [Model Attention Backend] → CurveAttn nodes → sampler`. The two
+CurveAttn nodes can be chained in either order with the same result:
 
-## Presets
+- **Sparse** owns the attention override. It installs itself on top of an
+  existing CurveAttn Sparse or Model Attention Backend and keeps it as the
+  dense fallback below. Any other attention patch (Model Sparse Attention,
+  Kitchen Sparse, Sage, ...) is refused.
+- **Cache** and `qkv_mode=chunked` share one CurveAttn block dispatcher per
+  transformer block, with a fixed layer order (cache outside, chunked attention
+  inside). Foreign dit block replacements are refused; so is a second cache.
+- **Two Sparse nodes** stack: on each step the most recently applied node whose
+  schedule says "sparse" handles attention, and the others pass through. For
+  example, an `sla` node for 0–0.5 followed by a `sol-attn` node for 0.5–1.
+  With overlapping windows the later node wins.
+- Each Sparse node publishes a policy fingerprint every step. The cache adds it
+  to the residual signature, so a step where no sparse node is active (a dense
+  step) refreshes instead of reusing a sparse residual.
+- `span=whole` requires `qkv_mode=native` on every stacked Sparse node
+  (checked in both orders).
 
-Cache presets set starting points, not card tunes. None of them set Max MiB.
+Do not combine the cache with other block caches (FirstBlockCache, TeaCache,
+SeaCache, MotionCache).
 
-| Preset | What it sets |
-|---|---|
-| `off` | cache disabled |
-| `manual` | leaves the widgets as they are |
-| `turbo_safe` | threshold 0.05, window 0.15–0.85, min steps 4, audio guard |
-| `native` | threshold 0.08, window 0.15–0.85, both guards |
-| `fast` | threshold 0.10, window 0.10–0.90, both guards |
+## Logs
 
-`turbo_safe` is the short-schedule (4–8 step turbo LoRA) starting point.
-`native` and `fast` are the long-schedule starting points and are unvalidated.
-On a 32 GB card, raise Max MiB yourself; 2048–3072 is a guess, not a measurement.
-
-## Cache limits
-
-Read these before turning the cache on.
-
-- `protect_audio` hard-disables the cache. `cache_audio_guard` only refuses a hit.
-- Masks, refs, keyframes and multigpu bypass the cache entirely.
-- Cache and `chunked` mode are rejected on multigpu.
-- A keep-% or tau lerp no longer invalidates the residual every step.
-- `whole` span skips every transformer block on a hit, disables dynamic block
-  prefetch, and requires `qkv_mode=native`. Middle-span residual add/sub is not
-  proven compatible with malloc-graph capture. If a cached run is slower than a
-  fresh one, turn the cache off.
-- A cache threshold is a drift gate, not an output-error bound.
-- No hits means no speedup. Check the log before expecting one.
-
-## Do not stack
-
-CurveAttention rejects a MODEL that already carries another attention or
-block-cache patch, and a second CurveAttention. Unwire H3 SLA, Model Sparse
-Attention, Kitchen Sparse, Sage, and external FirstBlockCache / TeaCache /
-SeaCache / MotionCache nodes from the same MODEL wire.
-
-Model Attention Backend can sit in front of it.
-
-## Migrating from 2.4
-
-Card presets are gone. A saved workflow that still names one will error — switch
-it to `manual` and set the widgets, or pick `native` / `fast` / `turbo_safe` and
-set Max MiB yourself.
-
-Removed: `Native/3090`, `Fast/3090`, `Native/4090`, `Fast/4090`, `Native/5090`,
-`Fast/5090`, `native_safe`, `native_fast`, `native_aggressive`.
-
-`selection` moved into the always-applied core, so closing the Sol-Attn section
-no longer flips it back to `sla`. Closing Backend no longer reverts
-`dense_backend` or `qkv_mode`.
+Each node logs a line at patch time and a summary at the end of every run
+(prefix `CurveAttn`). For the cache, watch `CurveAttn cache: hits=`: zero hits
+means the cache did no work; the warning names the last eligibility blocker.
 
 ## Tests
 
-CPU only, from the ComfyUI interpreter, no GPU:
+CPU only, no GPU or model weights:
 
-```bash
-python custom_nodes/CurveAttention/tools/run_cpu_tests.py --self-test
-python custom_nodes/CurveAttention/tools/run_cpu_tests.py
+```
+python custom_nodes/CurveAttn/tools/run_cpu_tests.py            # all
+python custom_nodes/CurveAttn/tools/run_cpu_tests.py test_composition
 ```
 
-The self-test proves the CPU guard actually blocks GPU work. GPU kernel tests
-need `--allow-gpu`:
+GPU kernel checks and the synthetic benchmark need explicit opt-in:
+`tools/run_gpu_tests.py --allow-gpu`, `benchmark_harness.py --allow-gpu`.
 
-```bash
-python custom_nodes/CurveAttention/tools/run_gpu_tests.py --allow-gpu
-```
+## Layout
 
-Passing either is not a speed or quality measurement.
+| File | Contents |
+|---|---|
+| `nodes.py` | The two V3 nodes and `comfy_entrypoint`. |
+| `sparse.py` | Sparse engine: step decisions, override chain, apply. |
+| `cache.py` | Presets, eligibility metadata, run scope, apply. |
+| `residual_cache.py` | `MiddleCache` reuse logic and drift measures. |
+| `blocks.py` | Shared per-block dispatcher (cache + chunked layers). |
+| `chunked_attention.py` | `qkv_mode=chunked` producer. |
+| `sol_attn.py`, `prepared_sol.py` | Kitchen kernel entry points. |
+| `common.py` | Step clock, H3 guards, CFG split, shared helpers. |
 
 ## License
 
-[Apache 2.0](LICENSE). ComfyUI core is GPL-3.0; this is a separate plugin, not
-a derivative of it.
-
-## Notes
-
-- [Cache speed modes](docs/cache-speed.md) — spans, modes, guards, telemetry.
-- [Larger-card notes](docs/rtx5090-settings.md) — setting Max MiB yourself.
+Apache 2.0, see `LICENSE`.

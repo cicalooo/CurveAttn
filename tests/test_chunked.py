@@ -2,7 +2,8 @@ import types
 import unittest
 from unittest.mock import Mock, patch
 import torch
-from curve_test_package import chunked_attention as ch
+from curvattn_test_package import chunked_attention as ch
+from helpers import sparse_state, step_options
 
 
 class ChunkedTests(unittest.TestCase):
@@ -72,6 +73,16 @@ class ChunkedTests(unittest.TestCase):
         self.assertIs(seen["kmean"], nxt[0])
         self.assertIs(seen["vscale"], nxt[1])
         self.assertIs(kept["kmean"], nxt[0])
+
+    def test_non_owner_step_uses_native_attention(self):
+        native = Mock(return_value="native")
+        state = sparse_state(dense_steps=frozenset())
+        call = ch.make_chunked_attention(native, state)
+        x = torch.ones(130, 256, dtype=torch.bfloat16)
+        with patch.object(ch, "run_chunked") as run:
+            self.assertEqual(call(x, transformer_options=step_options(state, dense=True)), "native")
+            run.assert_not_called()
+        native.assert_called_once()
 
     def test_failure_after_launch_propagates(self):
         kernel = Mock(side_effect=RuntimeError("launch failed"))
