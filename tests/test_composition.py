@@ -374,9 +374,13 @@ class NodeExecuteTests(unittest.TestCase):
             if entry.id in ("model", "selection"):
                 continue
             self.assertEqual(entry.default, signature[entry.id].default, entry.id)
-        nested = {i.id: i.default for o in schema.inputs[1].options for i in o.inputs}
-        for name, value in nested.items():
-            self.assertEqual(value, signature[name].default, name)
+        nested = {}
+        for option in schema.inputs[1].options:
+            for widget in option.inputs:
+                nested.setdefault(widget.id, set()).add(widget.default)
+        for name, defaults in nested.items():
+            self.assertIn(signature[name].default, defaults, name)
+        self.assertIn(10.0, nested["keep_percent"])
         manual = next(o for o in CurveAttnCache.define_schema().inputs[1].options
                       if o.key == "manual")
         self.assertEqual({i.id: i.default for i in manual.inputs}, cc.MANUAL_DEFAULTS)

@@ -4,9 +4,9 @@ MiniMax H3 sparse attention and an experimental residual cache for ComfyUI,
 as two independent V3 nodes. Sparse attention runs on the stock Comfy Kitchen
 `ck.sol_attn` kernel; the cache needs no special kernel at all.
 
-Version 3.2.0. The cache now works with denoise masks (masked edit / inpaint)
-as well as references and keyframes, and both nodes understand multi-stage
-samplers (see below).
+Version 3.3.0. Sparse adds `vsa`: 4×4×4 video cubes on the same kernel, fine
+stage only. The cache still works with denoise masks, references and keyframes,
+and both nodes understand multi-stage samplers (see below).
 
 3.x is a clean break from CurveAttention 2.x: the old `CurveAttention` node,
 its widget layout and its legacy cache preset names are gone, and workflows
@@ -29,9 +29,10 @@ Neither changes weights or the core forward.
 
 | Input | Default | Meaning |
 |---|---|---|
-| Selection | `sla` | `sla`: fixed top-k key blocks. `sol-attn`: adaptive tau threshold. Same kernel. |
+| Selection | `sla` | `sla`: fixed top-k key blocks. `sol-attn`: adaptive tau threshold. `vsa`: 4×4×4 video cubes. Same kernel. |
 | ↳ sla: Keep % / Keep % end | 20 / -1 | Percent of key blocks each query keeps; optional linear schedule toward *end* over the run (-1 off). |
 | ↳ sol-attn: Tau / Tau end | 1.3 / -1 | Threshold (higher is sparser); optional schedule (-1 off). |
+| ↳ vsa: Keep % | 10 | Percent of video cubes each query cube keeps. Fine stage only (no `to_gate_compress` / coarse gate). Prefix tiles, including text, audio, stills and guides, stay dense. Ignores tail, extra tokens and the protect toggles. `chunked` QKV is refused. |
 | Min tokens | 12288 | Shorter sequences stay dense. |
 | Dense steps | `1` | 0-based steps that always run dense (`1`, `0-1`, `0,2`). |
 | Dense last steps | 0 | Force the last N steps dense. |

@@ -308,11 +308,14 @@ class PolicyTests(unittest.TestCase):
                     end_percent=1., extra_tokens=0, dense_backend="comfy_kitchen_int8",
                     qkv_mode="native")
         sp.validate_sparse(**good)
+        sp.validate_sparse(**(good | dict(selection="vsa", keep_percent=10.)))
+        with self.assertRaisesRegex(ValueError, "qkv_mode"):
+            sp.validate_sparse(**(good | dict(selection="vsa", qkv_mode="chunked")))
         for change in [dict(tau=float("nan")), dict(keep_percent=float("inf")),
                        dict(extra_tokens=1), dict(extra_tokens=65),
                        dict(start_percent=.8, end_percent=.2), dict(keep_percent_end=-.5),
                        dict(tau_end=-.5), dict(dense_backend="unknown"),
-                       dict(qkv_mode="unknown"), dict(selection="vsa"), dict(min_tokens=True)]:
+                       dict(qkv_mode="unknown"), dict(selection="nope"), dict(min_tokens=True)]:
             with self.subTest(change=change), self.assertRaises(ValueError):
                 sp.validate_sparse(**(good | change))
 

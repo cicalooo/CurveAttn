@@ -1,7 +1,9 @@
 """CurveAttn Sparse: MiniMax H3 sparse attention on stock Comfy Kitchen sol_attn.
 
-One engine, two selection rules: ``sla`` keeps a fixed top-k fraction of key
-blocks, ``sol-attn`` uses the adaptive tau threshold. Both run ck.sol_attn.
+One engine, three selection rules. ``sla`` keeps a fixed top-k fraction of
+key blocks, ``sol-attn`` uses the adaptive tau threshold, ``vsa`` reorders
+the sequence into 4x4x4 video cubes and runs the same kernel with no coarse
+gate. All three call ck.sol_attn.
 
 Stacking contract
 -----------------
@@ -40,10 +42,11 @@ from .common import (
     schedule_progress, schedule_tuple,
 )
 from .sol_attn import check_prepared_available, consume_sla, prepare_sla, sol_attn_zerocopy
+from .vsa import build_vsa_plan, gather_qkv, scatter_rows
 
 WHO = f"{PREFIX} Sparse"
 _HEAD_DIM = 128
-SELECTIONS = ("sla", "sol-attn")
+SELECTIONS = ("sla", "sol-attn", "vsa")
 DENSE_BACKENDS = ("comfy_kitchen_int8", "pytorch")
 QKV_MODES = ("native", "owned_bf16", "chunked")
 
@@ -82,6 +85,8 @@ def validate_sparse(*, selection, keep_percent, keep_percent_end, tau, tau_end,
         raise ValueError(f"{WHO}: invalid dense_backend")
     if qkv_mode not in QKV_MODES:
         raise ValueError(f"{WHO}: invalid qkv_mode")
+    if selection == "vsa" and qkv_mode == "chunked":
+        raise ValueError(f"{WHO}: vsa requires native or owned_bf16 qkv_mode")
 
 
 # ---------------------------------------------------------------- state
@@ -137,6 +142,7 @@ class SparseState:
         self.verbose = bool(verbose)
         self.schedule = ()
         self.chunked_stats = {}
+        self._vsa_plans = {}
         self.lock = Lock()
         self.reset()
 
@@ -148,6 +154,7 @@ class SparseState:
         self.failure_reason = None
         self.prepared_enabled = self.prepared_available
         self.last_reason = None
+        self._vsa_plans = {}
 
     def log_once(self, key, message):
         if self.verbose and key not in self._logged:
@@ -158,6 +165,23 @@ class SparseState:
         if key not in self._logged:
             self._logged.add(key)
             LOG.warning("%s [%s]: %s", WHO, self.uid, message)
+
+    def info_once(self, key, message):
+        if key not in self._logged:
+            self._logged.add(key)
+            LOG.info("%s [%s]: %s", WHO, self.uid, message)
+
+    def vsa_plan(self, options, tokens, device):
+        """Cached cube plan for this forward, or None when VSA must stay dense."""
+        layout = (options or {}).get("minimax_h3_layout")
+        key = (tuple(getattr(layout, "signature", ()) or ()),
+               tuple(getattr(layout, "segments", ()) or ()),
+               str(device), int(tokens))
+        if key not in self._vsa_plans:
+            self._vsa_plans[key] = build_vsa_plan(layout, tokens, device)
+            while len(self._vsa_plans) > 4:
+                self._vsa_plans.pop(next(iter(self._vsa_plans)))
+        return self._vsa_plans[key]
 
     # -- policy ------------------------------------------------------------
 
@@ -215,11 +239,17 @@ class SparseState:
         decision = decision or self.base_decision()
         if self.selection == "sol-attn":
             topk_ratio, tau = 0.0, float(decision.tau)
+            tail, token_aug = self.tail, int(self.token_aug)
+        elif self.selection == "vsa":
+            # Fine stage only. Prefix sinks are supplied by the caller.
+            topk_ratio, tau = float(decision.topk), 0.0
+            tail, token_aug = False, 0
         else:
             topk_ratio, tau = float(decision.topk), 0.0
+            tail, token_aug = self.tail, int(self.token_aug)
         return dict(topk_ratio=topk_ratio, tau=tau, scale=scale,
                     sink_blocks=list(sink), sink_q=list(sink_q),
-                    tail=self.tail, token_aug=int(self.token_aug))
+                    tail=tail, token_aug=token_aug)
 
     # -- run lifecycle -------------------------------------------------------
 
@@ -318,10 +348,14 @@ def _run_dense(state, previous, q, k, v, heads, mask, attn_precision, skip_resha
     return state.dense_attention(*args, **kw)
 
 
+def _scatter(out, plan):
+    return out if plan is None else scatter_rows(out, plan["inv"])
+
+
 def _consume_prepared(state, prepared, input_dtype, skip_output_reshape,
-                      b, heads, dim_head, tokens, sink, sink_q):
+                      b, heads, dim_head, tokens, sink, sink_q, plan=None):
     # QKV is gone now; a consume failure cannot fall back to dense.
-    out = consume_sla(prepared)
+    out = _scatter(consume_sla(prepared), plan)
     selector = prepared.selector
     del prepared
     if input_dtype != torch.bfloat16:
@@ -331,6 +365,23 @@ def _consume_prepared(state, prepared, input_dtype, skip_output_reshape,
                    f"sparse ({b}, {tokens}, {heads}, {dim_head}) sinks {sink}/{sink_q} "
                    f"selector={selector} prepared_qkv=True block=64")
     return out.transpose(1, 2) if skip_output_reshape else out.reshape(b, -1, heads * dim_head)
+
+
+def _prepare_gathered(state, q, k, v, qs, ks, vs, options):
+    """Prepare already-tiled VSA views. Original containers stay until success."""
+    try:
+        prepared = prepare_sla(qs, ks, vs, **options)
+    except torch.OutOfMemoryError:
+        raise
+    except Exception as exc:
+        if is_fatal_device_error(exc):
+            raise
+        state.prepared_enabled = False
+        LOG.warning("%s: prepared backend unavailable (%s); native sol_attn for this run", WHO, exc)
+        return None, qs, ks, vs
+    for container in (q, k, v):
+        container.take()
+    return prepared, None, None, None
 
 
 def _prepare_or_disable(state, q, k, v, heads, skip_reshape, b, dim_head, options):
@@ -352,11 +403,12 @@ def _prepare_or_disable(state, q, k, v, heads, skip_reshape, b, dim_head, option
 
 
 def _run_native_sparse(state, q, k, v, qs, ks, vs, heads, skip_output_reshape,
-                       b, dim_head, sink, sink_q, options, input_dtype, owned, dense):
+                       b, dim_head, sink, sink_q, options, input_dtype, owned, dense,
+                       plan=None):
     if input_dtype != torch.bfloat16:
         qs, ks, vs = (t.to(torch.bfloat16) for t in (qs, ks, vs))
     try:
-        out = sol_attn_zerocopy(qs, ks, vs, **options)
+        out = _scatter(sol_attn_zerocopy(qs, ks, vs, **options), plan)
     except torch.OutOfMemoryError:
         raise
     except (RuntimeError, ValueError, NotImplementedError) as exc:
@@ -415,20 +467,38 @@ def make_attention_override(state: SparseState, previous=None):
         if sinks is None:
             return dense("H3 layout unavailable for requested protection")
         sink, sink_q = sinks
+        plan = None
+        if state.selection == "vsa":
+            plan = state.vsa_plan(transformer_options, tokens, inputs[0].device)
+            if plan is None:
+                return dense("H3 layout unavailable for VSA")
+            qs, ks, vs = gather_qkv(qs, ks, vs, plan["src"])
+            sink = sink_q = (0, plan["n_prefix"])
+            state.info_once(
+                ("vsa", plan["n"], plan["n_prefix"]),
+                "VSA fine stage: %d padded rows, %d prefix tiles, keep %.1f%%, no coarse gate"
+                % (plan["n"], plan["n_prefix"], 100.0 * float(decision.topk)))
         options = state.sparse_kwargs(kwargs.get("scale"), sink, sink_q, decision)
+        if plan is not None:
+            options["block_len"] = plan["block_len"]
         # The accepted SLA Kitchen path uses BF16 even for FP16 inputs.
         input_dtype = qs.dtype
         prepared = None
         if owned and state.prepared_enabled:
-            # Do not keep borrowed views alive while the owner frame consumes QKV.
-            del inputs, qs, ks, vs
-            prepared, qs, ks, vs = _prepare_or_disable(
-                state, q, k, v, heads, skip_reshape, b, dim_head, options)
+            if plan is None:
+                # Do not keep borrowed views alive while the owner frame consumes QKV.
+                del inputs, qs, ks, vs
+                prepared, qs, ks, vs = _prepare_or_disable(
+                    state, q, k, v, heads, skip_reshape, b, dim_head, options)
+            else:
+                prepared, qs, ks, vs = _prepare_gathered(
+                    state, q, k, v, qs, ks, vs, options)
         if prepared is not None:
             return _consume_prepared(state, prepared, input_dtype, skip_output_reshape,
-                                     b, heads, dim_head, tokens, sink, sink_q)
+                                     b, heads, dim_head, tokens, sink, sink_q, plan)
         return _run_native_sparse(state, q, k, v, qs, ks, vs, heads, skip_output_reshape,
-                                  b, dim_head, sink, sink_q, options, input_dtype, owned, dense)
+                                  b, dim_head, sink, sink_q, options, input_dtype, owned, dense,
+                                  plan)
 
     override.container_function = partial(override, None)
     for fn in (override, override.container_function):
@@ -565,6 +635,14 @@ def apply_sparse(model, *, selection="sla", keep_percent=20.0, keep_percent_end=
         except (RuntimeError, OSError) as exc:
             prepared_available = False
             LOG.warning("%s: %s; using native ck.sol_attn without owned BF16 copies", WHO, exc)
+    if selection == "vsa" and (tail or extra_tokens or protect_audio or protect_prefix):
+        LOG.info("%s: vsa ignores tail, extra tokens, and protect toggles; "
+                 "prefix tiles stay dense and there is no coarse gate", WHO)
+    if selection == "vsa":
+        tail = False
+        extra_tokens = 0
+        protect_audio = False
+        protect_prefix = False
     keep_ratio_end = (float(keep_percent_end) / 100.0
                       if float(keep_percent_end) >= 0.5 and selection == "sla" else None)
     scheduled_tau_end = (float(tau_end)
