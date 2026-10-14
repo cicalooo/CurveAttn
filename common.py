@@ -79,34 +79,69 @@ def schedule_tuple(value):
     return values
 
 
-def exact_step(schedule, current):
-    if len(schedule) < 2:
-        return None, 0
+def _sigma_value(current):
     if isinstance(current, torch.Tensor):
         if current.numel() != 1:
-            return None, len(schedule) - 1
+            return None
         current = float(current.detach().reshape(()).item())
     elif isinstance(current, (tuple, list)):
         if len(current) != 1:
-            return None, len(schedule) - 1
+            return None
         current = current[0]
     try:
         current = float(current)
     except (TypeError, ValueError):
-        return None, len(schedule) - 1
-    if not isfinite(current):
-        return None, len(schedule) - 1
-    matches = [i for i, s in enumerate(schedule[:-1])
-               if abs(s - current) <= max(1e-7, abs(s) * 1e-6)]
-    return (matches[0] if len(matches) == 1 else None), len(schedule) - 1
+        return None
+    return current if isfinite(current) else None
+
+
+def _matches(a, b):
+    return abs(a - b) <= max(1e-7, abs(a) * 1e-6)
+
+
+def schedule_position(schedule, current):
+    """Locate a model call on the run schedule: (step, total, substep).
+
+    An exact match of schedule[i] (i < last) is step i. A sigma strictly inside
+    (schedule[i], schedule[i+1]) is an intermediate stage of a multi-stage
+    sampler (heun midpoints, dpmpp_2s, res_2s, ...) and maps to step i with
+    substep=True. Ambiguous, out-of-range, final-sigma or non-finite values give
+    step None.
+    """
+    if len(schedule) < 2:
+        return None, 0, False
+    total = len(schedule) - 1
+    value = _sigma_value(current)
+    if value is None:
+        return None, total, False
+    matches = [i for i, s in enumerate(schedule) if _matches(s, value)]
+    if len(matches) > 1 or matches == [total]:
+        return None, total, False
+    if matches:
+        return matches[0], total, False
+    for i in range(total):
+        if schedule[i] > value > schedule[i + 1]:
+            return i, total, True
+    return None, total, False
+
+
+def exact_step(schedule, current):
+    """Step index only for an exact schedule sigma (substeps give None)."""
+    step, total, substep = schedule_position(schedule, current)
+    return (None if substep else step), total
 
 
 def resolve_step(options, schedule=()) -> tuple[int | None, int]:
-    """Step index from the run schedule, else from sample_sigmas."""
+    """Step index from the run schedule, else from sample_sigmas.
+
+    Substeps resolve to their enclosing interval, so dense_steps and windows
+    apply to every stage of a step.
+    """
     schedule = schedule or schedule_tuple((options or {}).get("sample_sigmas"))
     if not schedule:
         return None, 0
-    return exact_step(schedule, (options or {}).get("sigmas"))
+    step, total, _ = schedule_position(schedule, (options or {}).get("sigmas"))
+    return step, total
 
 
 def scalar(value) -> float | None:

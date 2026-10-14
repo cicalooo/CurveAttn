@@ -16,6 +16,14 @@ from helpers import SCHEDULE, dit, h3_patcher, kitchen, options
 OVERRIDE = common.OVERRIDE_KEY
 UID = UUID("00000000-0000-0000-0000-000000000001")
 LAYOUT = types.SimpleNamespace(segments=((0, 2, "text"), (2, 4, "audio"), (4, 6, "video")))
+REF_LAYOUTS = {name: types.SimpleNamespace(segments=segments) for name, segments in {
+    "ref_img": ((0, 2, "text"), (2, 4, "ref_img"), (4, 6, "audio"), (6, 10, "video")),
+    "ref_audio": ((0, 2, "text"), (2, 4, "ref_audio"), (4, 6, "audio"), (6, 10, "video")),
+    "keyframes": ((0, 2, "text"), (2, 4, "cond"), (4, 5, "cond_audio"), (5, 6, "audio"),
+                  (6, 10, "video")),
+    "all": ((0, 1, "text"), (1, 2, "cond"), (2, 3, "cond_audio"), (3, 4, "ref_audio"),
+            (4, 5, "ref_img"), (5, 6, "ref_img"), (6, 7, "audio"), (7, 10, "video")),
+}.items()}
 
 
 def chain(model):
@@ -216,33 +224,45 @@ class RunTests(unittest.TestCase):
     """Drive the real DIFFUSION_MODEL wrapper chain over the shared dispatchers."""
 
     @torch.no_grad()
-    def sample(self, model, steps):
+    def sample(self, model, steps, sigmas=None, layouts=None, payload=None, rows=6):
+        """steps index SCHEDULE; sigmas (if given) are raw per-call sigmas instead.
+        layouts optionally gives one layout per call; blocks add a row-dependent
+        residual so a hit that misses any row would change the output."""
         dispatch = [d for _, d in sorted(dit(model).items(), key=lambda kv: kv[0][1])]
         calls = []
+        row = torch.arange(float(rows)).unsqueeze(1)
+        sigmas = [SCHEDULE[step] for step in steps] if sigmas is None else list(sigmas)
+        layouts = [LAYOUT] * len(sigmas) if layouts is None else list(layouts)
 
         def forward(x, timestep, context, transformer_options=None, minimax_payload=None, **kw):
-            img = torch.ones(6, 4)
+            layout = transformer_options["layout_for_test"]
+            transformer_options["minimax_h3_layout"] = layout
+            img = torch.ones(rows, 4)
             for index, d in enumerate(dispatch):
                 def block(args, index=index):
                     calls.append(index)
-                    return {"img": args["img"].add_(index + 1)}
-                img = d(dict(img=img, layout=LAYOUT, transformer_options=transformer_options),
+                    return {"img": args["img"].add_(row * (index + 1) + 1)}
+                img = d(dict(img=img, layout=layout, transformer_options=transformer_options),
                         {"original_block": block})["img"]
             return img
 
         executor = WrapperExecutor.new_executor(
             forward, model.get_all_wrappers(WrappersMP.DIFFUSION_MODEL))
         outer = WrapperExecutor.new_executor(
-            lambda *a, **k: [executor.execute(None, None, None, transformer_options=dict(
-                sample_sigmas=SCHEDULE, sigmas=SCHEDULE[step], cond_or_uncond=[0],
-                uuids=[UID])) for step in steps],
+            lambda *a, **k: [executor.execute(
+                None, torch.tensor([sigma * 1000.]), None, transformer_options=dict(
+                    sample_sigmas=SCHEDULE, sigmas=sigma, cond_or_uncond=[0], uuids=[UID],
+                    layout_for_test=layout), minimax_payload=payload or {})
+                for sigma, layout in zip(sigmas, layouts)],
             model.get_all_wrappers(WrappersMP.OUTER_SAMPLE))
         cache = blocks.current_cache(model.model_options)
         seen = {}
         original = cache.run_scope.on_end
         with patch.object(cache.run_scope, "on_end",
-                          lambda run: seen.update(hits=run.cache.hits) or original(run)):
+                          lambda run: seen.update(hits=run.cache.hits, substeps=run.cache.substeps,
+                                                  bypasses=run.cache.bypasses) or original(run)):
             outputs = outer.execute(None, None, None, SCHEDULE)
+        self.seen = seen
         return outputs, calls, seen["hits"]
 
     def test_cache_hits_with_sparse_in_either_order(self):
@@ -266,6 +286,59 @@ class RunTests(unittest.TestCase):
     def test_cache_only_on_dense_model_hits(self):
         _, calls, hits = self.sample(cc.apply_cache(h3_patcher()), (2, 3))
         self.assertEqual(hits, 1)
+
+    def test_reference_and_keyframe_layouts_hit_end_to_end(self):
+        for name, layout in REF_LAYOUTS.items():
+            for sparse_first in (False, True):
+                with self.subTest(layout=name, sparse_first=sparse_first), kitchen():
+                    model = (cc.apply_cache(sp.apply_sparse(h3_patcher(), dense_steps="",
+                                                            min_tokens=0))
+                             if sparse_first else cc.apply_cache(h3_patcher()))
+                    outputs, calls, hits = self.sample(model, (2, 3), layouts=[layout] * 2, rows=10)
+                    self.assertEqual((hits, calls), (1, [0, 1, 2, 3, 0, 3]))
+                    torch.testing.assert_close(outputs[0], outputs[1], rtol=0, atol=0)
+
+    def test_changed_reference_set_mid_run_refreshes(self):
+        model = cc.apply_cache(h3_patcher())
+        layouts = [REF_LAYOUTS["ref_img"], REF_LAYOUTS["keyframes"], REF_LAYOUTS["keyframes"]]
+        _, calls, hits = self.sample(model, (2, 3, 4), layouts=layouts, rows=10)
+        self.assertEqual(hits, 1)
+        self.assertEqual(calls, [0, 1, 2, 3] * 2 + [0, 3])
+
+    def test_conditioning_pin_crossing_forces_a_refresh(self):
+        # aug .3: at step 2 (sigma .75, t_v .25) ref rows are pinned at .3; at
+        # step 3 (t_v .375) they track t_v, so step 3 must not reuse step 2.
+        payload = {"visual_cond_noise_aug": .3}
+        _, _, hits = self.sample(cc.apply_cache(h3_patcher()), (2, 3),
+                                 layouts=[REF_LAYOUTS["ref_img"]] * 2, payload=payload, rows=10)
+        self.assertEqual(hits, 0)
+        _, _, hits = self.sample(cc.apply_cache(h3_patcher()), (3, 4),
+                                 layouts=[REF_LAYOUTS["ref_img"]] * 2, payload=payload, rows=10)
+        self.assertEqual(hits, 1)
+        # no visual conditioning rows: the aug value is irrelevant
+        _, _, hits = self.sample(cc.apply_cache(h3_patcher()), (2, 3), payload=payload)
+        self.assertEqual(hits, 1)
+
+    def test_multistage_substeps_compute_fully_and_main_steps_still_hit(self):
+        # res_2s / dpmpp_2s style: step, midpoint, step, midpoint
+        sigmas = [SCHEDULE[2], .7, SCHEDULE[3], .55, SCHEDULE[4], .45]
+        with kitchen():
+            model = cc.apply_cache(sp.apply_sparse(h3_patcher(), dense_steps="", min_tokens=0),
+                                   max_hits=2)
+        outputs, calls, hits = self.sample(model, (), sigmas=sigmas,
+                                           layouts=[REF_LAYOUTS["all"]] * 6, rows=10)
+        self.assertEqual(hits, 2)
+        self.assertEqual(self.seen["substeps"], 3)
+        self.assertEqual(self.seen["bypasses"], 0)
+        full = [0, 1, 2, 3]
+        self.assertEqual(calls, full + full + [0, 3] + full + [0, 3] + full)
+        for out in outputs[1:]:
+            torch.testing.assert_close(out, outputs[0], rtol=0, atol=0)
+
+    def test_off_schedule_sigmas_still_bypass(self):
+        model = cc.apply_cache(h3_patcher())
+        _, calls, hits = self.sample(model, (), sigmas=[SCHEDULE[2], 1.5, SCHEDULE[3]])
+        self.assertEqual((hits, self.seen["bypasses"]), (0, 1))
 
 
 class NodeExecuteTests(unittest.TestCase):

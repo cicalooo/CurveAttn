@@ -36,6 +36,133 @@ class CacheFeatureTests(unittest.TestCase):
                            {}, meta, original)["img"]
         return x, calls
 
+    # -- reference / keyframe layouts ----------------------------------------
+
+    REF_LAYOUTS = {
+        "ref_img": ((0, 2, "text"), (2, 4, "ref_img"), (4, 6, "audio"), (6, 10, "video")),
+        "ref_audio": ((0, 2, "text"), (2, 4, "ref_audio"), (4, 6, "audio"), (6, 10, "video")),
+        "keyframes": ((0, 2, "text"), (2, 4, "cond"), (4, 5, "cond_audio"), (5, 6, "audio"),
+                      (6, 10, "video")),
+        "all": ((0, 1, "text"), (1, 2, "cond"), (2, 3, "cond_audio"), (3, 4, "ref_audio"),
+                (4, 5, "ref_img"), (5, 6, "ref_img"), (6, 7, "audio"), (7, 10, "video")),
+    }
+
+    def with_layout(self, segments):
+        self.layout = types.SimpleNamespace(segments=segments)
+
+    def test_conditioning_layouts_hit_and_cover_every_row(self):
+        for name, segments in self.REF_LAYOUTS.items():
+            with self.subTest(layout=name):
+                self.with_layout(segments)
+                cache = MiddleCache(threshold=.05, max_hits=1, max_bytes=10 ** 9, min_steps=4)
+                fresh, _ = self.run_chain(cache, step=2, rows=10)
+                hit, calls = self.run_chain(cache, step=3, rows=10)
+                self.assertEqual((cache.hits, cache.bypasses, calls), (1, 0, [0, 3]))
+                torch.testing.assert_close(hit, fresh, rtol=0, atol=0)
+
+    @torch.no_grad()
+    def test_hit_applies_a_row_dependent_residual_to_ref_rows(self):
+        self.with_layout(self.REF_LAYOUTS["all"])
+        cache = MiddleCache(threshold=.05, max_hits=1, max_bytes=10 ** 9, min_steps=4)
+        rows = torch.arange(10.).unsqueeze(1)
+
+        def run(step, x):
+            calls = []
+            meta = dict(eligible=True, key=(0,), step=step, total=8, dense=False, policy=())
+            x = x.clone()
+            for index in range(4):
+                def original(args, extra, index=index):
+                    calls.append(index)
+                    args["img"].add_(rows * (index + 1))
+                    return {"img": args["img"]}
+                x = cache.call(index, 4, dict(img=x, layout=self.layout), {}, meta, original)["img"]
+            return x, calls
+
+        x = torch.ones(10, 4)
+        run(2, x)
+        out, calls = run(3, x)
+        self.assertEqual(calls, [0, 3])
+        torch.testing.assert_close(out, x + rows * 10, rtol=0, atol=0)
+
+    def test_conditioning_rows_do_not_affect_drift(self):
+        self.with_layout(self.REF_LAYOUTS["all"])
+        cond_rows = [1, 2, 3, 4, 5]
+        cache = MiddleCache(threshold=.05, max_hits=1, max_bytes=10 ** 9, min_steps=4,
+                            temporal_guard=True, audio_guard=True)
+        self.run_chain(cache, step=2, rows=10)
+        x = torch.ones(10, 4)
+        x[cond_rows] = 50.
+        self.run_chain(cache, step=3, rows=10, x=x)
+        self.assertEqual(cache.hits, 1)
+        for row in (0, 6, 8):  # text, audio, video
+            with self.subTest(row=row):
+                cache = MiddleCache(threshold=.05, max_hits=1, max_bytes=10 ** 9, min_steps=4)
+                self.run_chain(cache, step=2, rows=10)
+                x = torch.ones(10, 4)
+                x[row] = 50.
+                self.run_chain(cache, step=3, rows=10, x=x)
+                self.assertEqual(cache.hits, 0)
+
+    def test_real_packed_layouts_with_refs_and_keyframes_are_accepted(self):
+        from comfy.ldm.minimax.model import PackedLayout
+        keyframes = [{"resolved_frame_index": 0, "latent": torch.zeros(1, 24, 1, 4, 4),
+                      "audio_latent": torch.zeros(1, 32, 2)}]
+        refs = [{"kind": "image", "latent_h": 4, "latent_w": 4},
+                {"kind": "audio", "ref_audio_t": 2},
+                {"kind": "video_audio", "ref_audio_t": 2, "latent_t": 1,
+                 "latent_h": 4, "latent_w": 4}]
+        for kf, rf in ((None, None), (keyframes, None), (None, refs), (keyframes, refs)):
+            layout = PackedLayout(3, 2, 4, 4, 2, keyframes=kf, refs=rf)
+            x = torch.ones(layout.seq_len, 4)
+            self.assertIsNone(rc.layout_problem(x, tuple(layout.segments)))
+            self.assertEqual([k for *_, k in rc.drift_segments(layout.segments)],
+                             ["text", "audio", "video"])
+        kinds = {k for *_, k in layout.segments}
+        self.assertEqual(kinds, set(rc.KNOWN_KINDS))
+
+    def test_changed_reference_layout_invalidates(self):
+        cache = MiddleCache(threshold=.05, max_hits=1, max_bytes=10 ** 9, min_steps=4)
+        self.with_layout(self.REF_LAYOUTS["ref_img"])
+        self.run_chain(cache, step=2, rows=10)
+        self.with_layout(self.REF_LAYOUTS["ref_audio"])
+        _, calls = self.run_chain(cache, step=3, rows=10)
+        self.assertEqual((cache.hits, cache.refreshes, calls), (0, 2, [0, 1, 2, 3]))
+
+    def test_unknown_or_malformed_layouts_are_rejected(self):
+        bad = {
+            "unknown": ((0, 2, "text"), (2, 4, "mask"), (4, 6, "audio"), (6, 10, "video")),
+            "no_video": ((0, 2, "text"), (2, 4, "ref_img"), (4, 10, "audio")),
+            "two_audio": ((0, 2, "text"), (2, 4, "audio"), (4, 6, "audio"), (6, 10, "video")),
+            "gap": ((0, 2, "text"), (3, 6, "audio"), (6, 10, "video")),
+            "short": ((0, 2, "text"), (2, 4, "audio"), (4, 9, "video")),
+            "empty": ((0, 2, "text"), (2, 2, "ref_img"), (2, 4, "audio"), (4, 10, "video")),
+            "none": (),
+        }
+        for name, segments in bad.items():
+            with self.subTest(layout=name):
+                self.with_layout(segments)
+                cache = MiddleCache(threshold=.05, max_hits=1, max_bytes=10 ** 9, min_steps=4)
+                self.run_chain(cache, step=2, rows=10)
+                _, calls = self.run_chain(cache, step=3, rows=10)
+                self.assertEqual((cache.hits, cache.bypasses, calls), (0, 2, [0, 1, 2, 3]))
+                self.assertIsNotNone(cache.last_bypass)
+        self.assertIn("unknown segment kind mask",
+                      rc.layout_problem(torch.ones(10, 4), bad["unknown"]))
+        self.assertEqual(rc.drift_segments(self.REF_LAYOUTS["all"]),
+                         ((0, 1, "text"), (6, 7, "audio"), (7, 10, "video")))
+
+    def test_substeps_compute_and_keep_the_store(self):
+        cache = MiddleCache(threshold=.05, max_hits=2, max_bytes=10 ** 9, min_steps=4)
+        self.run_chain(cache, step=2)
+        _, calls = self.run_chain(cache, step=2, substep=True, x=torch.full((8, 4), 9.))
+        self.assertEqual((calls, cache.substeps, cache.refreshes, cache.hits), ([0, 1, 2, 3], 1, 1, 0))
+        _, calls = self.run_chain(cache, step=3)
+        self.assertEqual((calls, cache.hits), ([0, 3], 1))
+        # an ineligible substep still clears like any other ineligible call
+        self.run_chain(cache, step=3, substep=True, eligible=False)
+        self.assertEqual(cache.entries, {})
+        self.assertIn("substeps=1", format_cache_report(cache))
+
     # -- presets / validation -------------------------------------------------
 
     def test_preset_maps(self):
@@ -235,6 +362,59 @@ class CacheFeatureTests(unittest.TestCase):
         for token in ("CurveAttn cache: hits=", "refreshes=", "bypasses=",
                       "budget_bypasses=", "bytes=", "span=middle", "mode=fingerprint"):
             self.assertIn(token, report)
+
+    # -- denoise masks --------------------------------------------------------
+
+    def test_fingerprint_samples_regenerating_rows_only(self):
+        x = torch.arange(8., dtype=torch.float32).unsqueeze(1).expand(8, 4).contiguous()
+        segs = ((0, 2, "text"), (2, 4, "audio"), (4, 8, "video"))
+        weights = torch.tensor([0., 0., 1., 1.])
+        got = rc.fingerprint(x, segs, {"video": weights})
+        plain = rc.fingerprint(x, segs)
+        self.assertEqual(got[2].shape[0], 2)
+        self.assertEqual(plain[2].shape[0], 4)
+        torch.testing.assert_close(got[2][:, 0], torch.tensor([6., 7.]))
+        empty = rc.fingerprint(x, segs, {"video": torch.zeros(4), "audio": torch.zeros(2)})
+        self.assertEqual(empty[1].numel(), 0)
+        self.assertEqual(empty[2].numel(), 0)
+        self.assertEqual(rc.relative_drift(empty, empty), 0.0)
+        self.assertEqual(rc.modality_drift(empty, empty, segs, "audio"), 0.0)
+        self.assertEqual(rc.temporal_video_drift(empty, empty, segs), 0.0)
+
+    def test_preserved_rows_do_not_gate_a_hit(self):
+        window = dict(min_steps=4, start_percent=0.0, end_percent=1.0)
+        weights = {"video": torch.tensor([0., 0., 1., 1.]), "audio": torch.zeros(2)}
+        cache = MiddleCache(threshold=.05, max_hits=1, max_bytes=10 ** 9,
+                            temporal_guard=True, audio_guard=True, **window)
+        self.run_chain(cache, drift_weights=weights, **window)
+        x = torch.ones(8, 4)
+        x[2:6] = 50.  # preserved audio + preserved video
+        self.run_chain(cache, step=3, x=x, drift_weights=weights, **window)
+        self.assertEqual(cache.hits, 1)
+        self.assertEqual(len(cache.entries), 1)
+
+    def test_regenerating_rows_gate_drift(self):
+        window = dict(min_steps=4, start_percent=0.0, end_percent=1.0)
+        weights = {"video": torch.tensor([0., 0., 1., 1.])}
+        cache = MiddleCache(threshold=.05, max_hits=1, max_bytes=10 ** 9, **window)
+        self.run_chain(cache, drift_weights=weights, **window)
+        x = torch.ones(8, 4)
+        x[6:8] = 2.
+        self.run_chain(cache, step=3, x=x, drift_weights=weights, **window)
+        self.assertEqual(cache.hits, 0)
+
+    def test_small_mask_is_not_diluted(self):
+        segs = ((0, 2, "text"), (2, 4, "audio"), (4, 68, "video"))
+        weights = torch.zeros(64)
+        weights[-2:] = 1
+        x0 = torch.ones(68, 4)
+        x1 = x0.clone()
+        x1[66:68] = 1.4
+        plain = rc.relative_drift(rc.fingerprint(x1, segs), rc.fingerprint(x0, segs))
+        weighted = rc.relative_drift(rc.fingerprint(x1, segs, {"video": weights}),
+                                     rc.fingerprint(x0, segs, {"video": weights}))
+        self.assertLess(plain, 0.05)
+        self.assertGreater(weighted, 0.05)
 
 
 if __name__ == "__main__":

@@ -4,22 +4,38 @@ Independent of sparse attention: it does not need ck.sol_attn and works on a
 dense H3 model. When CurveAttn Sparse nodes are stacked on the same MODEL,
 their published policy fingerprint joins the residual signature, so a change
 of attention policy (e.g. a dense step) refreshes instead of reusing.
+
+Reference / keyframe conditioning (ref_img, ref_audio, cond, cond_audio rows)
+is supported: those rows are carried by the residual like every other row but
+excluded from the drift decision, and the packed layout plus the conditioning
+timestep regime are part of the residual signature.
+
+Denoise masks (masked edit / inpaint / retake) are supported the same way.
+Preserved rows stay in the residual and out of the drift decision. The mask
+pattern joins the signature; a mask that cannot be aligned to the packed rows
+bypasses.
 """
 from __future__ import annotations
 
 from contextvars import ContextVar
 from dataclasses import dataclass, field
+from hashlib import sha1
 from math import isfinite
 from threading import Lock
 from uuid import UUID
 
+import torch
+
+from comfy.ldm.minimax.model import (
+    AUDIO_COND_TIMESTEP, VISUAL_COND_TIMESTEP, mask_row_values, time_shift_sigma,
+)
 from comfy.patcher_extension import CallbacksMP, WrappersMP
 
 from . import blocks
 from ._version import VERSION
 from .common import (
-    LOG, NS, PREFIX, check_object_patches, curve_states, exact_step,
-    install_cond_batch_limiter, require_h3, schedule_tuple,
+    LOG, NS, PREFIX, check_object_patches, curve_states, install_cond_batch_limiter,
+    require_h3, schedule_position, schedule_tuple,
 )
 from .residual_cache import MiddleCache, format_cache_report
 
@@ -92,30 +108,182 @@ def validate_cache(*, preset, threshold, max_hits, max_mib, span, start_percent,
 
 # ---------------------------------------------------------------- eligibility
 
-def cache_input_flags(payload, kwargs) -> dict:
-    """Forward-level facts the block dispatcher cannot see."""
+def timestep_values(timestep, payload, options, model=None):
+    """(t_v, t_a, visual_aug, audio_aug) exactly as MiniMaxH3Model._forward derives them."""
+    try:
+        t = torch.as_tensor(timestep).detach().flatten()[0].to("cpu", torch.float32)
+    except (TypeError, ValueError, IndexError, RuntimeError):
+        return None
+    options = options or {}
+    shift_v = float(options.get("minimax_h3_sigma_shift_video",
+                                getattr(model, "sigma_shift_video", 12.0)))
+    shift_a = float(options.get("minimax_h3_sigma_shift_audio",
+                                getattr(model, "sigma_shift_audio", 3.0)))
+    sigma_v = (t / 1000.0).float().clamp(min=1e-6)
     payload = payload or {}
+    return (float(1.0 - sigma_v), float(1.0 - time_shift_sigma(sigma_v, shift_v, shift_a)),
+            float(payload.get("visual_cond_noise_aug", VISUAL_COND_TIMESTEP)),
+            float(payload.get("audio_cond_noise_aug", AUDIO_COND_TIMESTEP)))
 
-    def present(value):
-        return value is not None and not (isinstance(value, (list, tuple)) and len(value) == 0)
 
+def timestep_regime(timesteps, segments):
+    """Which conditioning kinds are pinned vs tracking the target timestep, and how
+    many distinct timesteps the forward uses.
+
+    The cached residual is a hidden-state delta and does not depend on the
+    model's mod-row indices (those are rebuilt every forward). But when a
+    pinned conditioning stream starts tracking the target (t > its aug pin, at
+    the very end of a schedule) the function the middle blocks compute for
+    those rows changes, so the regime joins the signature and forces a refresh.
+    """
+    if timesteps is None:
+        return None
+    t_v, t_a, vis, aud = timesteps
+    target = {"cond": t_v, "ref_img": t_v, "cond_audio": t_a, "ref_audio": t_a}
+    seg_t = {"text": t_v, "video": t_v, "audio": t_a, "cond": max(t_v, vis),
+             "ref_img": max(t_v, vis), "cond_audio": max(t_a, aud), "ref_audio": max(t_a, aud)}
+    kinds = sorted({kind for _, _, kind in segments if kind in seg_t})
+    distinct = len({t_v, t_a} | {seg_t[k] for k in kinds})
+    pinned = tuple((k, seg_t[k] != target[k]) for k in kinds if k in target)
+    return (distinct,) + pinned
+
+
+@dataclass
+class MaskResolution:
+    """Aligned denoise mask for one forward, or why it cannot be used."""
+    problem: str | None
+    sig: tuple
+    weights: dict
+
+
+def cache_input_flags(payload, kwargs, timesteps=None) -> dict:
+    """Forward-level facts the block dispatcher cannot see.
+
+    The mask tensors themselves are kept so the first cached block can align
+    them to the packed layout. A bool would throw away the pattern the
+    signature and the drift sample both need.
+    """
+    kwargs = kwargs or {}
     return dict(
-        denoise_mask=any((kwargs or {}).get(k) is not None
-                         for k in ("denoise_mask", "audio_denoise_mask")),
-        refs=any(present(payload.get(k)) for k in ("refs", "keyframes")),
+        denoise_mask=kwargs.get("denoise_mask"),
+        audio_denoise_mask=kwargs.get("audio_denoise_mask"),
+        timesteps=timesteps,
     )
 
 
-def cache_blockers(options, inputs, *, identity_ok, step, total, min_steps):
-    """Why this step cannot cache. None when it can."""
+def _segment_len(segments, kind):
+    found = [b - a for a, b, k in segments if k == kind]
+    if len(found) != 1 or found[0] < 1:
+        return None
+    return found[0]
+
+
+def _finite_1d(values, n_rows):
+    if values is None or values.numel() != n_rows:
+        return False
+    return bool(torch.isfinite(values).all().item())
+
+
+def _video_weights(mask, latent_t, lat_h, lat_w, n_rows):
+    """Per-patch-row mask, None when every row fully generates, or 'bad'."""
+    if not torch.is_tensor(mask) or n_rows is None:
+        return "bad"
+    try:
+        plane = mask[0, 0]
+    except (IndexError, RuntimeError, TypeError):
+        return "bad"
+    if not torch.is_tensor(plane) or plane.ndim != 3:
+        return "bad"
+    if int(plane.shape[0]) != int(latent_t):
+        return "bad"
+    if int(plane.shape[-2]) > int(lat_h) or int(plane.shape[-1]) > int(lat_w):
+        return "bad"
+    if int(lat_h) < 2 or int(lat_w) < 2:
+        return "bad"
+    try:
+        values = mask_row_values(plane.detach().to(torch.float32), int(latent_t),
+                                 int(lat_h), int(lat_w))
+    except (RuntimeError, ValueError, IndexError, TypeError):
+        return "bad"
+    if values is None:
+        return None
+    values = values.detach().to(device="cpu", dtype=torch.float32)
+    if not _finite_1d(values, n_rows):
+        return "bad"
+    return values
+
+
+def _audio_weights(mask, n_rows):
+    """Flattened audio mask in pack order, None when every row fully generates, or 'bad'."""
+    if not torch.is_tensor(mask) or n_rows is None:
+        return "bad"
+    try:
+        flat = mask[0, 0].detach().to(dtype=torch.float32, device="cpu").reshape(-1)
+    except (IndexError, RuntimeError, TypeError, ValueError):
+        return "bad"
+    if not _finite_1d(flat, n_rows):
+        return "bad"
+    if bool((flat >= 1.0 - 1e-3).all().item()):
+        return None
+    return flat
+
+
+def _mask_token(weights):
+    """Quantized identity. Sigma-dependent timesteps stay out so consecutive steps can hit."""
+    q = torch.ceil(weights.clamp(0, 1) * 256).to(torch.int16).contiguous()
+    digest = sha1(q.numpy().astype("<i2").tobytes()).hexdigest()
+    return (int(q.numel()), q.unique().numel() > 1, digest)
+
+
+def resolve_masks(options, inputs) -> MaskResolution:
+    """Align denoise masks to the packed video/audio rows.
+
+    A uniform all-ones stream matches an absent mask: the model collapses it to
+    the stream timestep. Anything else that cannot be lined up bypasses.
+    """
+    if not inputs:
+        return MaskResolution(None, (), {})
+    video = inputs.get("denoise_mask")
+    audio = inputs.get("audio_denoise_mask")
+    if video is None and audio is None:
+        return MaskResolution(None, (), {})
+    layout = (options or {}).get("minimax_h3_layout")
+    signature = getattr(layout, "signature", None)
+    segments = tuple(getattr(layout, "segments", ()) or ())
+    if not signature or len(signature) != 5:
+        return MaskResolution("denoise mask unaligned", (), {})
+    _, latent_t, lat_h, lat_w, _ = signature
+    weights = {}
+    tokens = []
+    if video is not None:
+        got = _video_weights(video, latent_t, lat_h, lat_w, _segment_len(segments, "video"))
+        if got == "bad":
+            return MaskResolution("denoise mask unaligned", (), {})
+        if got is not None:
+            weights["video"] = got
+            tokens.append(("video", _mask_token(got)))
+    if audio is not None:
+        got = _audio_weights(audio, _segment_len(segments, "audio"))
+        if got == "bad":
+            return MaskResolution("denoise mask unaligned", (), {})
+        if got is not None:
+            weights["audio"] = got
+            tokens.append(("audio", _mask_token(got)))
+    return MaskResolution(None, tuple(tokens), weights)
+
+
+def cache_blockers(options, inputs, *, identity_ok, step, total, min_steps, mask_problem=None):
+    """Why this step cannot cache. None when it can.
+
+    An aligned denoise mask is eligible. Preserved rows are left out of the
+    drift decision and the mask pattern joins the residual signature. A mask
+    that cannot be read still bypasses.
+    """
     reasons = []
     if inputs is None:
         reasons.append("cache step wrapper did not run")
-    else:
-        if inputs.get("denoise_mask"):
-            reasons.append("denoise mask")
-        if inputs.get("refs"):
-            reasons.append("refs or keyframes")
+    elif mask_problem:
+        reasons.append(mask_problem)
     if "multigpu_thread_device" in options:
         reasons.append("multigpu")
     if not identity_ok:
@@ -130,8 +298,10 @@ def cache_blockers(options, inputs, *, identity_ok, step, total, min_steps):
 
 
 def cache_metadata(options, inputs, *, schedule, policy, min_steps=6,
-                   start_percent=0.2, end_percent=0.8):
-    step, total = exact_step(schedule, options.get("sigmas"))
+                   start_percent=0.2, end_percent=0.8, masks=None):
+    if masks is None:
+        masks = resolve_masks(options, inputs)
+    step, total, substep = schedule_position(schedule, options.get("sigmas"))
     branches = options.get("cond_or_uncond", ())
     uuids = options.get("uuids", ())
     identity_ok = (isinstance(branches, (list, tuple)) and len(branches) == 1
@@ -144,15 +314,15 @@ def cache_metadata(options, inputs, *, schedule, policy, min_steps=6,
         except (TypeError, ValueError, AttributeError):
             identity_ok = False
     blockers = cache_blockers(options, inputs, identity_ok=identity_ok, step=step,
-                              total=total, min_steps=min_steps)
+                              total=total, min_steps=min_steps, mask_problem=masks.problem)
     ns = options.get(NS) or {}
     # A step is dense for the cache only when sparse nodes ran and none owns it.
     dense = "owner" in ns and ns.get("owner") is None
     return dict(eligible=blockers is None, reason=blockers,
                 key=(branches[0], identity) if identity_ok else None,
-                step=step, total=total, dense=dense, policy=policy,
+                step=step, total=total, substep=substep, dense=dense, policy=policy,
                 min_steps=int(min_steps), start_percent=float(start_percent),
-                end_percent=float(end_percent))
+                end_percent=float(end_percent), drift_weights=masks.weights)
 
 
 # ---------------------------------------------------------------- run scope
@@ -243,23 +413,44 @@ class CacheState:
             self._logged.add(key)
             LOG.warning("%s: %s", WHO, message)
 
-    def policy(self, options):
+    def info_once(self, key, message):
+        if key not in self._logged:
+            self._logged.add(key)
+            LOG.info("%s: %s", WHO, message)
+
+    def policy(self, options, masks=None):
         ns = options.get(NS) or {}
-        return (ns.get("policy", ()),
+        layout = options.get("minimax_h3_layout")
+        segments = tuple(getattr(layout, "segments", ()))
+        timesteps = (ns.get("cache_inputs") or {}).get("timesteps")
+        if masks is None:
+            masks = resolve_masks(options, ns.get("cache_inputs"))
+        # masks.sig is the quantized mask identity. Empty when there is no mask
+        # or it is uniform all-ones (the model treats that as unmasked). The
+        # per-row timesteps themselves stay out: they move every step.
+        return (ns.get("policy", ()), timestep_regime(timesteps, segments), masks.sig,
                 options.get("minimax_h3_sigma_shift_video"),
                 options.get("minimax_h3_sigma_shift_audio"),
                 self.span, self.mode, self.start_percent, self.end_percent,
                 self.min_steps, self.temporal_guard, self.audio_guard)
 
     def metadata(self, options, run):
+        inputs = (options.get(NS) or {}).get("cache_inputs")
+        masks = resolve_masks(options, inputs)
         meta = cache_metadata(
-            options, (options.get(NS) or {}).get("cache_inputs"),
-            schedule=run.schedule, policy=self.policy(options),
+            options, inputs, schedule=run.schedule, policy=self.policy(options, masks),
             min_steps=self.min_steps, start_percent=self.start_percent,
-            end_percent=self.end_percent)
+            end_percent=self.end_percent, masks=masks)
+        if masks.weights:
+            self.info_once(("mask", "active"),
+                           "denoise mask active: drift on regenerating rows")
         if meta["reason"]:
             self.last_block = meta["reason"]
             self.warn_once(("ineligible", meta["reason"]), "cache ineligible: " + meta["reason"])
+            if meta["step"] is None and run.schedule:
+                self.warn_once(("sigma", "first"), "first unmatched sigma %r; schedule has %d steps "
+                               "from %.6g to %.6g" % (options.get("sigmas"), len(run.schedule) - 1,
+                                                      run.schedule[0], run.schedule[-1]))
         return meta
 
     def report(self, run):
@@ -273,6 +464,8 @@ class CacheState:
                  "on_demand" if self.span == "whole" else "inherit")
         if cache.hits == 0:
             blocked = f" last_block={self.last_block}" if self.last_block else ""
+            if cache.last_bypass and cache.last_bypass != self.last_block:
+                blocked += f" last_bypass={cache.last_bypass}"
             LOG.warning("%s had zero hits; inspect eligibility, schedule, threshold and "
                         "storage budget before expecting a cache speedup.%s", WHO, blocked)
 
@@ -294,7 +487,9 @@ def make_cache_step_wrapper(state: CacheState):
                 minimax_payload=None, **kwargs):
         to = forward_options(transformer_options, state.span)
         ns = dict(to.get(NS) or {})
-        ns["cache_inputs"] = cache_input_flags(minimax_payload, kwargs)
+        ns["cache_inputs"] = cache_input_flags(
+            minimax_payload, kwargs,
+            timestep_values(timestep, minimax_payload, to, getattr(executor, "class_obj", None)))
         to[NS] = ns
         if "multigpu_thread_device" in to:
             raise ValueError(f"{WHO}: residual cache is not validated for multigpu")

@@ -158,7 +158,9 @@ class CurveAttnCache(io.ComfyNode):
                 "Experimental branch-scoped reuse of the MiniMax H3 middle-block residual. "
                 "In the graph means on (bypass the node to turn it off). Works on a dense H3 "
                 "model and does not need sol_attn. Stacks with CurveAttn Sparse in either order. "
-                "Do not combine with other block caches (FirstBlockCache, TeaCache, ...)."
+                "Masked edit / inpaint noise masks are supported: drift is measured on "
+                "regenerating rows. Do not combine with other block caches "
+                "(FirstBlockCache, TeaCache, ...)."
             ),
             inputs=[
                 io.Model.Input("model", tooltip="MiniMax H3 model to patch."),

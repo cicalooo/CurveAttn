@@ -76,6 +76,17 @@ class PolicyTests(unittest.TestCase):
         self.assertTrue(self.decision(self.wrap(s, {}, payload), s).dense)
         self.assertEqual(common.resolve_step({"sample_sigmas": [], "sigmas": 1}), (None, 0))
 
+    def test_substep_sigmas_follow_the_enclosing_step(self):
+        s = state()  # dense_steps={1}
+        schedule = [1.0, 0.75, 0.5, 0.25, 0.0]
+        actual = [self.decision(self.wrap(s, {"sample_sigmas": schedule, "sigmas": sigma}), s)
+                  for sigma in [0.9, 0.75, 0.6, 0.4, 0.1]]
+        self.assertEqual([d.dense for d in actual], [False, True, True, False, False])
+        self.assertEqual([d.step for d in actual], [0, 1, 1, 2, 3])
+        for sigma in [1.5, 0.0, float("nan")]:
+            self.assertTrue(self.decision(self.wrap(
+                s, {"sample_sigmas": schedule, "sigmas": sigma}), s).dense, sigma)
+
     def test_owner_published_only_on_sparse_steps(self):
         s = state()
         schedule = [1.0, 0.5, 0.0]

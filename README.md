@@ -4,9 +4,13 @@ MiniMax H3 sparse attention and an experimental residual cache for ComfyUI,
 as two independent V3 nodes. Sparse attention runs on the stock Comfy Kitchen
 `ck.sol_attn` kernel; the cache needs no special kernel at all.
 
-Version 3.0.0. This is a clean break from CurveAttention 2.x: the old
-`CurveAttention` node, its widget layout and its legacy cache preset names
-are gone, and workflows using it must be rebuilt with the nodes below.
+Version 3.2.0. The cache now works with denoise masks (masked edit / inpaint)
+as well as references and keyframes, and both nodes understand multi-stage
+samplers (see below).
+
+3.x is a clean break from CurveAttention 2.x: the old `CurveAttention` node,
+its widget layout and its legacy cache preset names are gone, and workflows
+using it must be rebuilt with the nodes below.
 
 ## Requirements
 
@@ -55,17 +59,70 @@ In the graph means on; bypass the node to turn it off.
 | ↳ Min steps | 6 | Shortest schedule that may hit. |
 | ↳ Temporal guard | off | Also bound the worst video row-chunk drift. |
 | ↳ Audio guard | off | Refuse a hit if audio drifted (keeps the store). |
-| ↳ Mode | `fingerprint` | `fingerprint` samples T/A/V drift; `first_block` uses the span-input delta. |
+| ↳ Mode | `fingerprint` | `fingerprint` samples text/audio/video drift; `first_block` uses the span-input delta. |
 | Max MiB | 1024 | Residual budget across at most two CFG branches. Presets never set it. |
 
 Preset values: `turbo_safe` threshold 0.05, window 0.15–0.85, min steps 4,
 audio guard. `native` 0.08, 0.15–0.85, temporal+audio guard. `fast` 0.10,
 0.10–0.90, temporal+audio guard.
 
-The cache is skipped (and logged once) for masked/inpaint runs, references or
-keyframes, multi-GPU, batched CFG branches, sigmas that do not match the
-schedule, and schedules shorter than Min steps. Both nodes split CFG into one
-branch per call because H3 rejects batch > 1.
+The cache is skipped (and logged once) for multi-GPU, batched CFG branches,
+sigmas that are not on the schedule, schedules shorter than Min steps, and a
+denoise mask that cannot be aligned to the packed video/audio rows. Both nodes
+split CFG into one branch per call because H3 rejects batch > 1.
+
+#### References and keyframes
+
+Reference images/audio/video (`ref_img`, `ref_audio` rows) and keyframes
+(`cond`, `cond_audio` rows) are supported:
+
+- The cached residual covers the whole packed sequence, conditioning rows
+  included, so a hit updates every row exactly as a fresh middle stack would
+  (to the same approximation as plain t2v: conditioning rows attend to the
+  noisy target, so their per-block output also moves between steps).
+- Drift (fingerprint, temporal and audio guards) is measured on the denoised
+  text, audio and video rows only. Conditioning rows, and denoise-mask rows
+  that are fully preserved, sit at a pinned near-clean timestep and do not
+  count toward the drift decision.
+- The packed layout is part of the residual signature: a different reference
+  or keyframe set (or a different shape) refreshes instead of reusing.
+- When a conditioning stream stops being pinned (its target timestep passes
+  the cond noise-aug pin, normally only in the last sliver of the schedule),
+  the cache refreshes at that step.
+- Any segment kind other than text, audio, video, cond, cond_audio, ref_img
+  and ref_audio makes the cache bypass for that call.
+
+#### Masked edit and inpaint
+
+`denoise_mask` / `audio_denoise_mask` are supported. That is the path used by
+masked-edit, soft-mask, retake, and any other node that sets a latent
+`noise_mask` (CF H3 Masked Edit, CF H3 Soft Mask Edit, H3 Retake, and the same
+pattern). Add Guide / keyframes do not set a denoise mask; they were already
+supported as conditioning rows.
+
+- Preserved rows (mask ≈ 0) are carried in the residual and left out of the
+  drift decision, same as keyframes. Drift is sampled from regenerating rows,
+  weighted by mask strength, so a small edit region is not hidden by frozen
+  background.
+- The mask pattern is part of the residual signature. A mid-run change (Soft
+  Mask Edit releasing the mask, or any `denoise_mask_function` that changes
+  the pattern) refreshes instead of reusing. Per-row timesteps are not in the
+  signature; they move every step the same way the global timestep already does.
+- A mask that is non-finite or does not line up with the packed video/audio
+  rows bypasses for that call.
+- Same approximation as plain t2v. Keep the threshold conservative. Temporal
+  guard still bounds the worst regenerating chunk.
+
+#### Multi-stage samplers
+
+A call whose sigma lies strictly between two schedule points (heun-style
+midpoints, `dpmpp_2s`, `res_2s`, ...) belongs to the enclosing step. The
+Sparse node applies that step's schedule (dense steps, keep/tau schedule) to
+it. The cache runs such substeps in full and leaves its store alone: it
+neither refreshes from nor reuses on a substep, so hits only happen on main
+steps and the hit chain is not broken. Sigmas that are off the schedule,
+ambiguous, the final sigma, or non-finite still bypass. The run summary
+reports `substeps=`.
 
 ## Stacking and order
 
@@ -96,7 +153,11 @@ SeaCache, MotionCache).
 
 Each node logs a line at patch time and a summary at the end of every run
 (prefix `CurveAttn`). For the cache, watch `CurveAttn cache: hits=`: zero hits
-means the cache did no work; the warning names the last eligibility blocker.
+means the cache did no work; the warning names the last eligibility blocker
+(and the last layout/runtime bypass reason). An off-schedule sigma is logged
+once with its value and the schedule range. A masked run that lined up logs
+`denoise mask active: drift on regenerating rows` once; `denoise mask unaligned`
+means the mask could not be mapped onto the packed rows.
 
 ## Tests
 
