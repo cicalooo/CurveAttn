@@ -5,7 +5,7 @@ slot: the residual cache wraps the middle stack and chunked qkv swaps the
 block's attention. A slot holds one callable, so CurveAttn installs a single
 immutable ``CurveBlockDispatch`` per block and every node rebuilds it with
 its own layer added. The layer order is fixed here (cache outside, chunked
-attention inside), so node order in the graph does not matter. A fresh
+attention or VSA gate inside), so node order in the graph does not matter. A fresh
 dispatcher is built per apply, so the input MODEL is never mutated.
 """
 from __future__ import annotations
@@ -76,10 +76,11 @@ def current_cache(model_options):
     return None
 
 
-def install(patcher, diffusion_model, *, cache=None, provider=None):
+def install(patcher, diffusion_model, *, cache=None, provider=None, provider_factory=None):
     """Rebuild every block dispatcher on ``patcher`` (a clone) with a new layer."""
     check_dit(patcher.model_options, PREFIX)
     from .chunked_attention import make_chunked_attention
+    factory = provider_factory or make_chunked_attention
 
     existing = _dit(patcher.model_options)
     if cache is not None and current_cache(patcher.model_options) is not None:
@@ -93,7 +94,7 @@ def install(patcher, diffusion_model, *, cache=None, provider=None):
         if cache is not None:
             layer_cache = cache
         if provider is not None:
-            providers = providers + ((provider, make_chunked_attention(block.attn, provider, index)),)
+            providers = providers + ((provider, factory(block.attn, provider, index)),)
         patcher.set_model_patch_replace(
             CurveBlockDispatch(index, count, block.attn, layer_cache, providers),
             "dit", "double_block", index)

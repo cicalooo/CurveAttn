@@ -10,6 +10,7 @@ import comfy_kitchen as ck
 from comfy.model_management import cast_to
 
 from .common import h3_sinks
+from .vsa import permute_rows
 
 
 def projection_chunks(attention, x, chunk_tokens=2048):
@@ -64,6 +65,43 @@ def run_chunked(attention, x, rope_freqs, options, *, kernel=None, cast=None,
     return attention.out_proj(out.reshape(x.shape[0], attention.heads * attention.head_dim))
 
 
+def run_chunked_vsa(attention, x, rope_freqs, options, plan, *, kernel=None, cast=None,
+                    kmean=None, vscale=None, on_stats=None, chunk_tokens=2048):
+    """VSA through the chunked producer, as core Model Sparse Attention does:
+    x rows are permuted per chunk, RoPE is pre-permuted once per plan, and the
+    coarse gate (when the checkpoint has to_gate_compress) is filled per chunk."""
+    if chunk_tokens <= 0 or chunk_tokens % 64:
+        raise ValueError("CurveAttn: chunk_tokens must be positive and 64-aligned")
+    kernel = ck.sol_attn_chunked if kernel is None else kernel
+    cast = (lambda weight: cast_to(weight, device=x.device)) if cast is None else cast
+    heads, head_dim = attention.heads, attention.head_dim
+    n, src = plan["n"], plan["src"]
+    gate_layer = getattr(attention, "to_gate_compress", None)
+    kw = dict(options)
+    kw.update(tail=False, block_len=plan["block_len"], token_aug=0,
+              sink_blocks=[0, plan["n_prefix"]], sink_q=[0, plan["n_prefix"]])
+    gate = None
+    if gate_layer is not None:
+        gate = x.new_empty(n, heads * head_dim)
+        kw["coarse_gate"] = gate.view(1, n, heads, head_dim)
+
+    def factory():
+        for start in range(0, n, chunk_tokens):
+            xc = permute_rows(x, src[start:start + chunk_tokens])
+            if gate is not None:
+                gate[start:start + xc.shape[0]] = gate_layer(xc)
+            yield attention.qkv_proj(xc).to(torch.bfloat16)
+
+    out, kmean_next, vscale_next = kernel(
+        factory, t=n, h=heads, rope_freqs=rope_freqs,
+        qk_norm_weights=(cast(attention.q_norm.weight), cast(attention.k_norm.weight)),
+        kmean=kmean, vscale=vscale, rope_eps=attention.q_norm.eps, **kw)
+    if on_stats is not None:
+        on_stats(kmean_next, vscale_next)
+    out = out.reshape(n, heads * head_dim)[plan["inv"]]
+    return attention.out_proj(out)
+
+
 def make_chunked_attention(attention, state, index=0):
     def call(x, rope_freqs=None, transformer_options=None):
         options = transformer_options or {}
@@ -72,7 +110,16 @@ def make_chunked_attention(attention, state, index=0):
             reason = reason or "not this node's sparse step"
         else:
             reason = chunked_reason(attention, x, rope_freqs, state, options)
-        sinks = h3_sinks(options, x.shape[0], state.protect_audio, state.protect_prefix)
+        vsa = getattr(state, "selection", None) == "vsa"
+        plan = None
+        if vsa:
+            sinks = ((0, 0), (0, 0))
+            if reason is None:
+                plan = state.vsa_plan(options, x.shape[0], x.device)
+                if plan is None:
+                    reason = "H3 layout unavailable for VSA"
+        else:
+            sinks = h3_sinks(options, x.shape[0], state.protect_audio, state.protect_prefix)
         if sinks is None:
             reason = reason or "layout unavailable for protection"
         if reason is not None:
@@ -81,17 +128,26 @@ def make_chunked_attention(attention, state, index=0):
             return attention(x, rope_freqs=rope_freqs, transformer_options=options)
         sparse_options = state.sparse_kwargs(None, sinks[0], sinks[1], decision)
         stats = state.chunked_stats
-        prev = stats.get(index, (None, None))
+        key = index if plan is None else (index, plan["n"])
+        prev = stats.get(key, (None, None))
 
         def keep(kmean_next, vscale_next):
             if kmean_next is not None:
-                stats[index] = (kmean_next, vscale_next)
+                stats[key] = (kmean_next, vscale_next)
 
-        result = run_chunked(attention, x, rope_freqs, sparse_options,
-                             kmean=prev[0], vscale=prev[1], on_stats=keep)
+        if plan is None:
+            result = run_chunked(attention, x, rope_freqs, sparse_options,
+                                 kmean=prev[0], vscale=prev[1], on_stats=keep)
+        else:
+            result = run_chunked_vsa(attention, x, state.vsa_rope_freqs(rope_freqs, plan),
+                                     sparse_options, plan,
+                                     kmean=prev[0], vscale=prev[1], on_stats=keep)
         state.chunked_calls += 1
         state.sparse_calls += 1
-        state.log_once(("chunked", index), f"selector=chunked block={index}")
+        state.log_once(("chunked", index), f"selector=chunked block={index}"
+                       + ("" if plan is None else
+                          f" vsa rows={plan['n']} prefix_tiles={plan['n_prefix']} "
+                          f"coarse_gate={getattr(attention, 'to_gate_compress', None) is not None}"))
         return result
 
     return call

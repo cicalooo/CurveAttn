@@ -26,7 +26,7 @@ class RegistrationTests(unittest.TestCase):
         module = self.load()
         self.assertFalse(hasattr(module, "NODE_CLASS_MAPPINGS"))
         self.assertFalse(hasattr(module, "NODE_DISPLAY_NAME_MAPPINGS"))
-        self.assertEqual(module.__version__, "3.3.0")
+        self.assertEqual(module.__version__, "3.4.0")
 
         async def listed():
             return await (await module.comfy_entrypoint()).get_node_list()

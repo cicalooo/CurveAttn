@@ -4,8 +4,9 @@ MiniMax H3 sparse attention and an experimental residual cache for ComfyUI,
 as two independent V3 nodes. Sparse attention runs on the stock Comfy Kitchen
 `ck.sol_attn` kernel; the cache needs no special kernel at all.
 
-Version 3.3.0. Sparse adds `vsa`: 4×4×4 video cubes on the same kernel, fine
-stage only. The cache still works with denoise masks, references and keyframes,
+Version 3.4.0. Sparse `vsa` (4×4×4 video cubes) now runs fine + coarse gate
+(`to_gate_compress`) when the checkpoint has it, works with `chunked` QKV, and
+keeps an LRU plan cache. The cache still works with denoise masks, references and keyframes,
 and both nodes understand multi-stage samplers (see below).
 
 3.x is a clean break from CurveAttention 2.x: the old `CurveAttention` node,

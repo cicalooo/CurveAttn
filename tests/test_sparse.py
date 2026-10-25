@@ -309,8 +309,7 @@ class PolicyTests(unittest.TestCase):
                     qkv_mode="native")
         sp.validate_sparse(**good)
         sp.validate_sparse(**(good | dict(selection="vsa", keep_percent=10.)))
-        with self.assertRaisesRegex(ValueError, "qkv_mode"):
-            sp.validate_sparse(**(good | dict(selection="vsa", qkv_mode="chunked")))
+        sp.validate_sparse(**(good | dict(selection="vsa", qkv_mode="chunked")))
         for change in [dict(tau=float("nan")), dict(keep_percent=float("inf")),
                        dict(extra_tokens=1), dict(extra_tokens=65),
                        dict(start_percent=.8, end_percent=.2), dict(keep_percent_end=-.5),

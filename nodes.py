@@ -21,8 +21,8 @@ class CurveAttnSparse(io.ComfyNode):
             description=(
                 "MiniMax H3 sparse attention on stock Comfy Kitchen sol_attn. "
                 "sla keeps a fixed top-k fraction of key blocks; sol-attn uses an adaptive "
-                "tau threshold; vsa reorders video into 4x4x4 cubes (fine stage only, no "
-                "coarse gate). Stacks with CurveAttn Residual Cache in either order and "
+                "tau threshold; vsa reorders video into 4x4x4 cubes and adds the coarse "
+                "branch when the checkpoint has to_gate_compress (FastH3-VSA). Stacks with CurveAttn Residual Cache in either order and "
                 "with another CurveAttn Sparse (the later one wins overlapping steps). "
                 "Model Attention Backend may sit in front; other attention patches are refused."
             ),
@@ -51,12 +51,13 @@ class CurveAttnSparse(io.ComfyNode):
                         io.Float.Input("keep_percent", display_name="Keep %", default=10.0,
                                        min=0.5, max=95.0, step=0.5,
                                        tooltip="Percent of video cubes each query cube keeps. "
-                                               "10 matches FastH3-VSA. Fine stage only: no coarse "
-                                               "gate. Prefix tiles stay dense. Needs native or "
-                                               "owned_bf16 QKV."),
+                                               "10 matches FastH3-VSA. Uses the model's "
+                                               "to_gate_compress coarse branch when present, "
+                                               "else fine stage only. Prefix tiles stay dense. "
+                                               "Works with every QKV mode."),
                     ]),
-                ], tooltip="sla: fixed keep %. sol-attn: adaptive tau. vsa: 4x4x4 video cubes, "
-                           "fine stage only. Same Kitchen kernel."),
+                ], tooltip="sla: fixed keep %. sol-attn: adaptive tau. vsa: 4x4x4 video cubes "
+                           "plus coarse gate when available. Same Kitchen kernel."),
                 io.Int.Input("min_tokens", display_name="Min tokens", default=12288, min=0,
                              max=1 << 20, step=512,
                              tooltip="Sequences shorter than this stay fully dense."),
@@ -96,7 +97,7 @@ class CurveAttnSparse(io.ComfyNode):
                                default="native", advanced=True,
                                tooltip="native keeps aligned views. owned_bf16 copies only when "
                                        "QKV does not own its storage. chunked streams QKV "
-                                       "projection chunks (whole-span cache needs native; vsa cannot use chunked)."),
+                                       "projection chunks (whole-span cache needs native)."),
                 io.Boolean.Input("verbose", display_name="Verbose", default=False, advanced=True,
                                  tooltip="Log sparse vs dense once per shape."),
             ],

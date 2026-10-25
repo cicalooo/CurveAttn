@@ -2,8 +2,9 @@
 
 One engine, three selection rules. ``sla`` keeps a fixed top-k fraction of
 key blocks, ``sol-attn`` uses the adaptive tau threshold, ``vsa`` reorders
-the sequence into 4x4x4 video cubes and runs the same kernel with no coarse
-gate. All three call ck.sol_attn.
+the sequence into 4x4x4 video cubes and adds VSA's coarse branch when the
+checkpoint has ``to_gate_compress`` (fine stage only otherwise). All three
+call ck.sol_attn (or ck.sol_attn_chunked for qkv_mode=chunked).
 
 Stacking contract
 -----------------
@@ -20,6 +21,8 @@ Stacking contract
 """
 from __future__ import annotations
 
+import weakref
+from collections import OrderedDict
 from contextlib import contextmanager, nullcontext
 from functools import partial
 from math import isfinite
@@ -42,13 +45,15 @@ from .common import (
     schedule_progress, schedule_tuple,
 )
 from .sol_attn import check_prepared_available, consume_sla, prepare_sla, sol_attn_zerocopy
-from .vsa import build_vsa_plan, gather_qkv, scatter_rows
+from .vsa import (build_vsa_plan, gather_qkv, has_gate, make_vsa_gate_attention, scatter_rows,
+                  take_gate)
 
 WHO = f"{PREFIX} Sparse"
 _HEAD_DIM = 128
 SELECTIONS = ("sla", "sol-attn", "vsa")
 DENSE_BACKENDS = ("comfy_kitchen_int8", "pytorch")
 QKV_MODES = ("native", "owned_bf16", "chunked")
+VSA_PLAN_CACHE = 4
 
 
 # ---------------------------------------------------------------- validation
@@ -85,8 +90,6 @@ def validate_sparse(*, selection, keep_percent, keep_percent_end, tau, tau_end,
         raise ValueError(f"{WHO}: invalid dense_backend")
     if qkv_mode not in QKV_MODES:
         raise ValueError(f"{WHO}: invalid qkv_mode")
-    if selection == "vsa" and qkv_mode == "chunked":
-        raise ValueError(f"{WHO}: vsa requires native or owned_bf16 qkv_mode")
 
 
 # ---------------------------------------------------------------- state
@@ -142,7 +145,10 @@ class SparseState:
         self.verbose = bool(verbose)
         self.schedule = ()
         self.chunked_stats = {}
-        self._vsa_plans = {}
+        self._vsa_plans = OrderedDict()   # LRU, kept across runs, cleared in cleanup()
+        self._vsa_last = None             # (weakref(layout), device, plan) fast path
+        self._vsa_rope = None             # (weakref(rope_freqs), plan, permuted)
+        self.vsa_gate = False
         self.lock = Lock()
         self.reset()
 
@@ -154,7 +160,6 @@ class SparseState:
         self.failure_reason = None
         self.prepared_enabled = self.prepared_available
         self.last_reason = None
-        self._vsa_plans = {}
 
     def log_once(self, key, message):
         if self.verbose and key not in self._logged:
@@ -174,14 +179,37 @@ class SparseState:
     def vsa_plan(self, options, tokens, device):
         """Cached cube plan for this forward, or None when VSA must stay dense."""
         layout = (options or {}).get("minimax_h3_layout")
+        if layout is None or getattr(layout, "seq_len", None) != tokens:
+            return None
+        device_key = str(device)
+        last = self._vsa_last
+        if last is not None and last[0]() is layout and last[1] == device_key:
+            return last[2]
         key = (tuple(getattr(layout, "signature", ()) or ()),
-               tuple(getattr(layout, "segments", ()) or ()),
-               str(device), int(tokens))
-        if key not in self._vsa_plans:
-            self._vsa_plans[key] = build_vsa_plan(layout, tokens, device)
-            while len(self._vsa_plans) > 4:
-                self._vsa_plans.pop(next(iter(self._vsa_plans)))
-        return self._vsa_plans[key]
+               tuple(getattr(layout, "segments", ()) or ()), device_key)
+        plans = self._vsa_plans
+        if key in plans:
+            plans.move_to_end(key)
+            plan = plans[key]
+        else:
+            plan = plans[key] = build_vsa_plan(layout, tokens, device)
+            while len(plans) > VSA_PLAN_CACHE:
+                plans.popitem(last=False)
+        try:
+            self._vsa_last = (weakref.ref(layout), device_key, plan)
+        except TypeError:
+            self._vsa_last = None
+        return plan
+
+    def vsa_rope_freqs(self, rope_freqs, plan):
+        """RoPE in tile order (pad rows zero), once per plan and rope tensor."""
+        hit = self._vsa_rope
+        if hit is not None and hit[0]() is rope_freqs and hit[1] is plan:
+            return hit[2]
+        padded = rope_freqs.new_zeros((1, plan["n"]) + tuple(rope_freqs.shape[2:]))
+        padded[0, plan["inv"]] = rope_freqs[0]
+        self._vsa_rope = (weakref.ref(rope_freqs), plan, padded)
+        return padded
 
     # -- policy ------------------------------------------------------------
 
@@ -283,6 +311,9 @@ class SparseState:
     def cleanup(self):
         self.schedule = ()
         self.chunked_stats = {}
+        self._vsa_plans.clear()
+        self._vsa_last = None
+        self._vsa_rope = None
         self.reset()
 
 
@@ -472,15 +503,20 @@ def make_attention_override(state: SparseState, previous=None):
             plan = state.vsa_plan(transformer_options, tokens, inputs[0].device)
             if plan is None:
                 return dense("H3 layout unavailable for VSA")
+            gate = take_gate(transformer_options, state, plan)
             qs, ks, vs = gather_qkv(qs, ks, vs, plan["src"])
             sink = sink_q = (0, plan["n_prefix"])
             state.info_once(
-                ("vsa", plan["n"], plan["n_prefix"]),
-                "VSA fine stage: %d padded rows, %d prefix tiles, keep %.1f%%, no coarse gate"
-                % (plan["n"], plan["n_prefix"], 100.0 * float(decision.topk)))
+                ("vsa", plan["n"], plan["n_prefix"], gate is not None),
+                "VSA: %d padded rows, %d prefix tiles, keep %.1f%%, %s"
+                % (plan["n"], plan["n_prefix"], 100.0 * float(decision.topk),
+                   "fine + coarse gate" if gate is not None else "fine stage only (no coarse gate)"))
         options = state.sparse_kwargs(kwargs.get("scale"), sink, sink_q, decision)
         if plan is not None:
             options["block_len"] = plan["block_len"]
+            if gate is not None:
+                options["coarse_gate"] = gate if gate.dtype == torch.bfloat16 else gate.to(torch.bfloat16)
+                del gate
         # The accepted SLA Kitchen path uses BF16 even for FP16 inputs.
         input_dtype = qs.dtype
         prepared = None
@@ -635,9 +671,13 @@ def apply_sparse(model, *, selection="sla", keep_percent=20.0, keep_percent_end=
         except (RuntimeError, OSError) as exc:
             prepared_available = False
             LOG.warning("%s: %s; using native ck.sol_attn without owned BF16 copies", WHO, exc)
+    vsa_gate = selection == "vsa" and has_gate(diffusion_model)
     if selection == "vsa" and (tail or extra_tokens or protect_audio or protect_prefix):
         LOG.info("%s: vsa ignores tail, extra tokens, and protect toggles; "
-                 "prefix tiles stay dense and there is no coarse gate", WHO)
+                 "prefix tiles stay dense", WHO)
+    if selection == "vsa" and not vsa_gate:
+        LOG.warning("%s: model has no to_gate_compress layers; VSA runs the fine stage "
+                    "without the coarse branch", WHO)
     if selection == "vsa":
         tail = False
         extra_tokens = 0
@@ -658,14 +698,19 @@ def apply_sparse(model, *, selection="sla", keep_percent=20.0, keep_percent_end=
         sigma_start=sigma_start, sigma_end=sigma_end, dense_backend=dense_backend,
         qkv_mode=qkv_mode, prepared_available=prepared_available, verbose=bool(verbose))
 
+    state.vsa_gate = vsa_gate
     m = model.clone()
     install_override(state, m.model_options["transformer_options"])
+    block_provider = qkv_mode == "chunked" or vsa_gate
     if qkv_mode == "chunked":
         blocks.install(m, diffusion_model, provider=state)
+    elif vsa_gate:
+        blocks.install(m, diffusion_model, provider=state,
+                       provider_factory=make_vsa_gate_attention)
 
     def _prepare(model_patcher, timestep, model_options):
         install_override(state, model_options["transformer_options"])
-        blocks.verify(model_options, WHO, provider=state if qkv_mode == "chunked" else None)
+        blocks.verify(model_options, WHO, provider=state if block_provider else None)
 
     key = f"curvattn_{state.uid}"
     m.add_callback_with_key(CallbacksMP.ON_PREPARE_STATE, key, _prepare)
@@ -678,11 +723,12 @@ def apply_sparse(model, *, selection="sla", keep_percent=20.0, keep_percent_end=
         "%s %s [%s]: selection=%s keep=%.1f%% keep_end=%.1f tau=%.3f tau_end=%.3f "
         "extra_tokens=%d start_percent=%.3f end_percent=%.3f sigma_start=%s sigma_end=%s "
         "qkv_mode=%s prepared_qkv=%s dense_backend=%s dense_steps=%s dense_last_steps=%d "
-        "protect_prefix=%s protect_audio=%s tail=%s disable_fp16_accum=%s stack=%s",
+        "protect_prefix=%s protect_audio=%s tail=%s disable_fp16_accum=%s vsa_gate=%s stack=%s",
         WHO, VERSION, state.uid, selection, float(keep_percent), float(keep_percent_end),
         float(tau), float(tau_end), int(extra_tokens), float(start_percent), float(end_percent),
         None if sigma_start is None else f"{sigma_start:.6g}",
         None if sigma_end is None else f"{sigma_end:.6g}",
         qkv_mode, state.prepared_enabled, dense_backend, sorted(steps), state.dense_last_steps,
-        state.protect_prefix, state.protect_audio, state.tail, state.disable_fp16_accum, stacked)
+        state.protect_prefix, state.protect_audio, state.tail, state.disable_fp16_accum, vsa_gate,
+        stacked)
     return m

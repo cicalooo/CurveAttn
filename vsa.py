@@ -1,15 +1,23 @@
-"""Fine-stage VSA tiling for the existing sol_attn call.
+"""VSA tiling and coarse gate for the sol_attn calls.
 
 Matches ComfyUI's Model Sparse Attention cube plan: non-video segments are
-zero-padded 64-row prefix tiles, target video is 4x4x4 cubes. There is no
-coarse gate. RoPE is already on each token, so the override only permutes
-Q, K and V, then scatters the kernel output back to packed order.
+zero-padded 64-row prefix tiles, target video is 4x4x4 cubes. In native QKV
+mode RoPE is already on each token, so the override only permutes Q, K and V,
+then scatters the kernel output back to packed order. The coarse branch needs
+the block input x, so a block-level provider (``make_vsa_gate_attention``)
+computes ``to_gate_compress`` on the permuted rows and hands it to the
+override through ``transformer_options[NS]["vsa_gate"]``. Checkpoints without
+``to_gate_compress`` run the fine stage only.
 """
 from __future__ import annotations
 
 import torch
 
+from .common import NS
+
 BLOCK = 64
+GATE_CHUNK = 4096
+GATE_KEY = "vsa_gate"
 CUBE = (4, 4, 4)
 
 
@@ -88,3 +96,64 @@ def gather_qkv(q, k, v, src):
 def scatter_rows(out, inv):
     """Map kernel rows back to packed order."""
     return out.index_select(1, inv)
+
+
+def permute_rows(x, src):
+    """Packed (S, C) rows into tile order for ``src``. Pad rows are zero."""
+    return x[src.clamp_min(0)] * (src >= 0).unsqueeze(1).to(x.dtype)
+
+
+def has_gate(diffusion_model) -> bool:
+    return any(getattr(block.attn, "to_gate_compress", None) is not None
+               for block in diffusion_model.blocks)
+
+
+def coarse_gate(gate_layer, x, plan, heads, head_dim, chunk=GATE_CHUNK):
+    """``to_gate_compress`` on the permuted rows as ``(1, n, H, D)``, built in
+    chunks so the permuted x is never materialised whole."""
+    n, src = plan["n"], plan["src"]
+    gate = x.new_empty(n, heads * head_dim)
+    for i in range(0, n, chunk):
+        gate[i:i + chunk] = gate_layer(permute_rows(x, src[i:i + chunk]))
+    return gate.view(1, n, heads, head_dim)
+
+
+def with_gate(options, state, plan, gate):
+    """Copy of options carrying this node's gate for the attention override."""
+    out = dict(options or {})
+    ns = dict(out.get(NS) or {})
+    ns[GATE_KEY] = (state.uid, plan, gate)
+    out[NS] = ns
+    return out
+
+
+def take_gate(options, state, plan):
+    """The gate published for this node and plan, or None. Removes it so the
+    tensor dies with the attention call."""
+    ns = (options or {}).get(NS)
+    entry = ns.get(GATE_KEY) if isinstance(ns, dict) else None
+    if entry is None or entry[0] != state.uid or entry[1] is not plan:
+        return None
+    ns.pop(GATE_KEY, None)
+    return entry[2]
+
+
+def make_vsa_gate_attention(attention, state, index=0):
+    """Block attention that adds the VSA coarse gate, then runs the normal
+    attention module (and so the CurveAttn override chain)."""
+    gate_layer = getattr(attention, "to_gate_compress", None)
+
+    def call(x, rope_freqs=None, transformer_options=None):
+        options = transformer_options or {}
+        decision, _, _ = state.resolve(options)
+        plan = None
+        if (gate_layer is not None and decision is not None and state.failure_reason is None
+                and x.ndim == 2 and x.shape[0] >= state.min_tokens):
+            plan = state.vsa_plan(options, x.shape[0], x.device)
+        if plan is None:
+            return attention(x, rope_freqs=rope_freqs, transformer_options=options)
+        gated = with_gate(options, state, plan,
+                          coarse_gate(gate_layer, x, plan, attention.heads, attention.head_dim))
+        return attention(x, rope_freqs=rope_freqs, transformer_options=gated)
+
+    return call

@@ -51,14 +51,18 @@ def sol_attn_zerocopy(
     token_aug: int = 0,
     tau: float = 0.0,
     block_len=None,
+    coarse_gate=None,
 ) -> torch.Tensor:
     """Keep native threshold arithmetic, partial blocks, ties and dispatch.
 
     A Python tile/cat/top-k loop is not kernel fusion and adds work at
     ordinary H3 lengths. Use the installed operation, including its selector.
-    ``block_len`` is the VSA tile live-count; SLA and sol-attn leave it unset.
+    ``block_len`` is the VSA tile live-count and ``coarse_gate`` the VSA coarse
+    branch gate; SLA and sol-attn leave both unset.
     """
     extra = {} if block_len is None else {"block_len": block_len}
+    if coarse_gate is not None:
+        extra["coarse_gate"] = maybe_contiguous(coarse_gate)
     return ck.sol_attn(
         maybe_contiguous(q), maybe_contiguous(k), maybe_contiguous(v),
         topk_ratio=topk_ratio,
