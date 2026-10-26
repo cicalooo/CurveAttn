@@ -25,6 +25,21 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(common.parse_steps("  "), frozenset())
         self.assertEqual(common.parse_steps(""), frozenset())
 
+    def test_bare_zero_means_no_dense_steps(self):
+        self.assertEqual(common.parse_steps("0"), frozenset())
+        self.assertEqual(common.parse_steps(" 0 "), frozenset())
+        self.assertEqual(common.parse_steps("0-0"), frozenset({0}))
+        self.assertEqual(common.parse_steps("0,1"), frozenset({0, 1}))
+
+    def test_cleanup_inside_sampling_keeps_counts_for_report(self):
+        s = state()
+        s.sparse_calls, s.dense_calls = 5, 2
+        with s.lock:
+            s.cleanup()  # ComfyUI fires ON_CLEANUP before our outer() reports
+        self.assertEqual((s.sparse_calls, s.dense_calls), (5, 2))
+        s.cleanup()
+        self.assertEqual((s.sparse_calls, s.dense_calls), (0, 0))
+
     def test_parse_steps_rejects_invalid_leftover(self):
         for bad in ("1a", "0-1x", "step:1", "1..2", "0_1", "1/2"):
             with self.subTest(bad=bad), self.assertRaises(ValueError):

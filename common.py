@@ -43,8 +43,12 @@ _DENSE_STEPS_SEPARATORS = re.compile(r"[\s,;]+")
 
 
 def parse_steps(text: str) -> frozenset[int]:
-    """Parse dense step specs like '1', '0-1', '0,2'. Reject leftover junk."""
+    """Parse dense step specs like '1', '0-1', '0,2'. Reject leftover junk.
+
+    A bare '0' (or blank) means no dense steps; '0-0' selects step 0 alone."""
     text = text or ""
+    if text.strip() == "0":
+        return frozenset()
     remainder = _DENSE_STEPS_SEPARATORS.sub("", _DENSE_STEPS_TOKEN.sub("", text))
     if remainder:
         raise ValueError(

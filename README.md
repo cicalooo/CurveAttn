@@ -4,9 +4,10 @@ MiniMax H3 sparse attention and an experimental residual cache for ComfyUI,
 as two independent V3 nodes. Sparse attention runs on the stock Comfy Kitchen
 `ck.sol_attn` kernel; the cache needs no special kernel at all.
 
-Version 3.4.0. Sparse `vsa` (4×4×4 video cubes) now runs fine + coarse gate
-(`to_gate_compress`) when the checkpoint has it, works with `chunked` QKV, and
-keeps an LRU plan cache. The cache still works with denoise masks, references and keyframes,
+Version 3.6.0. New sparse selection `reblock`: per-head content-clustered
+video blocks with an anchor-reweighted tail (see [Reblock](#reblock)). Sparse
+`vsa` (4×4×4 video cubes) runs fine + coarse gate (`to_gate_compress`) when the
+checkpoint has it, works with `chunked` QKV, and keeps an LRU plan cache. The cache still works with denoise masks, references and keyframes,
 and both nodes understand multi-stage samplers (see below).
 
 3.x is a clean break from CurveAttention 2.x: the old `CurveAttention` node,
@@ -30,12 +31,13 @@ Neither changes weights or the core forward.
 
 | Input | Default | Meaning |
 |---|---|---|
-| Selection | `sla` | `sla`: fixed top-k key blocks. `sol-attn`: adaptive tau threshold. `vsa`: 4×4×4 video cubes. Same kernel. |
+| Selection | `sla` | `sla`: fixed top-k key blocks. `sol-attn`: adaptive tau threshold. `vsa`: 4×4×4 video cubes. `reblock`: clustered video blocks + reweighted tail. |
 | ↳ sla: Keep % / Keep % end | 20 / -1 | Percent of key blocks each query keeps; optional linear schedule toward *end* over the run (-1 off). |
 | ↳ sol-attn: Tau / Tau end | 1.3 / -1 | Threshold (higher is sparser); optional schedule (-1 off). |
 | ↳ vsa: Keep % | 10 | Percent of video cubes each query cube keeps. Fine stage only (no `to_gate_compress` / coarse gate). Prefix tiles, including text, audio, stills and guides, stay dense. Ignores tail, extra tokens and the protect toggles. `chunked` QKV is refused. |
+| ↳ reblock: Keep % / Tail / Center updates / Plan refresh | 20 / `pooled` / 1 / 2 | Percent of clustered video blocks each video query block computes exactly (plus the ±1 band); what skipped blocks contribute (`pooled` Kitchen int8 tail, `reweighted` flex_attention summaries, `off`); 2-means refinements per bisection (1 is the speed/quality balance); block-order reuse steps (routing stays per call). Conditioning rows stay dense and exact. Ignores tail, extra tokens and the protect toggles; always runs as `native` QKV. |
 | Min tokens | 12288 | Shorter sequences stay dense. |
-| Dense steps | `1` | 0-based steps that always run dense (`1`, `0-1`, `0,2`). |
+| Dense steps | `1` | 0-based steps that always run dense (`1`, `0-1`, `0,2`). A bare `0` or blank means none; use `0-0` for step 0 alone. |
 | Dense last steps | 0 | Force the last N steps dense. |
 | Sparse start / end | 0 / 1 | Sampling-progress window where sparse is allowed. |
 | Protect audio | off | Keep target-audio query rows dense. Does **not** affect the cache. |
@@ -173,6 +175,43 @@ python custom_nodes/CurveAttn/tools/run_cpu_tests.py test_composition
 GPU kernel checks and the synthetic benchmark need explicit opt-in:
 `tools/run_gpu_tests.py --allow-gpu`, `benchmark_harness.py --allow-gpu`.
 
+### Reblock
+
+`reblock` regroups the target-video rows of every layer call before the sparse
+kernel runs:
+
+- **Order.** Keys are seen through the queries (`k @ L`, `L Lᵀ = E[qqᵀ] + ridge`,
+  one query sampled per 64 rows) and cut into full 64-row blocks per batch row and
+  head by a capacity-balanced spherical 2-means bisection. Queries reuse the key
+  order, so one permutation serves Q, K and V and is undone after the call.
+- **Scope.** Text, reference, audio and other rows before the target video, plus
+  the `video % 64` highest-norm video rows, sit in zero-padded prefix tiles that are
+  exact keys and dense queries. Only target video → target video is sparse.
+- **Routing.** Each video query block keeps the top Keep % video blocks by
+  `mean(q)·k̄·scale + log_mass`, plus the ±1 band.
+- **Tail.** `reweighted` covers every skipped block with one summary key `k̄`,
+  value `v̄` and score bias `log_mass` from the block's softmax at a float32 per-head
+  anchor (the mean video query), merged with the exact keys in one softmax. This
+  path is a single block-sparse `torch.nn.attention.flex_attention` call; if it
+  cannot compile the node logs once and uses the `pooled` Kitchen `sol_attn` tail
+  for the rest of the run. `pooled` / `off` run Kitchen `sol_attn` on the
+  reblocked order. `pooled` is the default: bf16 flex_attention has no int8 path
+  and on sm86 measured ~71 s/it vs ~27.5 s/it dense, so `reweighted` is opt-in.
+  Verbose logs a per-step `plan ms / attention ms / path` line and path counts.
+- Planning is one segmented GPU sort per bisection level along each node's
+  principal direction (cached 32-dim sketch of the whitened keys, per-head
+  index_select gathers), with no host syncs. **Plan refresh** N (default 2)
+  reuses each layer's block order for N steps (cache keyed by block index,
+  cond/uncond and shape; ~5 MB VRAM per layer per branch); routing is still
+  recomputed every call. `Center updates` defaults to 1 (≈35% faster planning
+  than 2 with similar block purity); 0 is fastest.
+- Warm-up uses the usual Dense steps / Sparse start. The order needs the whole K,
+  so `owned_bf16` / `chunked` QKV fall back to `native`.
+
+Original design based on the underlying math: reblocking, anchor-reweighted
+summaries with mass correction and target-video-only sparse scope. No
+external code is used and no patched Comfy Kitchen is needed.
+
 ## Layout
 
 | File | Contents |
@@ -183,6 +222,7 @@ GPU kernel checks and the synthetic benchmark need explicit opt-in:
 | `residual_cache.py` | `MiddleCache` reuse logic and drift measures. |
 | `blocks.py` | Shared per-block dispatcher (cache + chunked layers). |
 | `chunked_attention.py` | `qkv_mode=chunked` producer. |
+| `reblock.py` | `reblock` selection: clustered order, summaries, flex tail. |
 | `sol_attn.py`, `prepared_sol.py` | Kitchen kernel entry points. |
 | `common.py` | Step clock, H3 guards, CFG split, shared helpers. |
 

@@ -4,6 +4,7 @@ from typing_extensions import override
 from comfy_api.latest import ComfyExtension, io
 
 from .cache import CACHE_PRESETS, MANUAL_DEFAULTS, apply_cache
+from .reblock import SUMMARIES
 from .sparse import DENSE_BACKENDS, QKV_MODES, apply_sparse
 
 CATEGORY = "model/patch/CurveAttn"
@@ -17,12 +18,13 @@ class CurveAttnSparse(io.ComfyNode):
             display_name="CurveAttn Sparse",
             category=CATEGORY,
             is_experimental=True,
-            search_aliases=["SLA", "Sol-Attn", "VSA", "sparse attention"],
+            search_aliases=["SLA", "Sol-Attn", "VSA", "reblock", "sparse attention"],
             description=(
                 "MiniMax H3 sparse attention on stock Comfy Kitchen sol_attn. "
                 "sla keeps a fixed top-k fraction of key blocks; sol-attn uses an adaptive "
                 "tau threshold; vsa reorders video into 4x4x4 cubes and adds the coarse "
-                "branch when the checkpoint has to_gate_compress (FastH3-VSA). Stacks with CurveAttn Residual Cache in either order and "
+                "branch when the checkpoint has to_gate_compress (FastH3-VSA); reblock clusters video "
+                "keys into similar 64-token blocks per head with a reweighted tail. Stacks with CurveAttn Residual Cache in either order and "
                 "with another CurveAttn Sparse (the later one wins overlapping steps). "
                 "Model Attention Backend may sit in front; other attention patches are refused."
             ),
@@ -56,14 +58,43 @@ class CurveAttnSparse(io.ComfyNode):
                                                "else fine stage only. Prefix tiles stay dense. "
                                                "Works with every QKV mode."),
                     ]),
+                    io.DynamicCombo.Option("reblock", [
+                        io.Float.Input("keep_percent", display_name="Keep %", default=20.0,
+                                       min=0.5, max=95.0, step=0.5,
+                                       tooltip="Percent of clustered video blocks each video "
+                                               "query block computes exactly (plus the +-1 band). "
+                                               "Conditioning rows stay dense and exact."),
+                        io.Combo.Input("reblock_summary", display_name="Tail", options=list(SUMMARIES),
+                                       default="pooled",
+                                       tooltip="Skipped video blocks: pooled = Kitchen "
+                                               "sol_attn mean tail (default, fastest); "
+                                               "reweighted = anchor-"
+                                               "reweighted summaries with mass correction "
+                                               "(flex_attention, bf16; ~2.5x slower than "
+                                               "dense on RTX 30xx); off = dropped."),
+                        io.Int.Input("reblock_updates", display_name="Center updates", default=1,
+                                     min=0, max=4,
+                                     tooltip="Extra direction refinements per split when "
+                                             "building blocks. 1 is the speed/quality balance "
+                                             "(2 is tighter, 0 is fastest). "
+                                             "Runs as native QKV mode."),
+                        io.Int.Input("reblock_refresh", display_name="Plan refresh", default=2,
+                                     min=1, max=8,
+                                     tooltip="Steps each layer's block order is reused. 2 "
+                                             "halves planning cost (routing stays per call). "
+                                             "1 = replan every step. Cache "
+                                             "costs ~5 MB VRAM per layer per branch."),
+                    ]),
                 ], tooltip="sla: fixed keep %. sol-attn: adaptive tau. vsa: 4x4x4 video cubes "
-                           "plus coarse gate when available. Same Kitchen kernel."),
+                           "plus coarse gate when available. reblock: per-head clustered "
+                           "blocks, reweighted tail."),
                 io.Int.Input("min_tokens", display_name="Min tokens", default=12288, min=0,
                              max=1 << 20, step=512,
                              tooltip="Sequences shorter than this stay fully dense."),
                 io.String.Input("dense_steps", display_name="Dense steps", default="1",
                                 tooltip="0-based steps that always run dense. 1 means the second "
-                                        "step (SLA default). Examples: 1, 0-1, 0,2."),
+                                        "step (SLA default). Examples: 1, 0-1, 0,2. 0 or blank = "
+                                        "none; 0-0 = step 0 only."),
                 io.Int.Input("dense_last_steps", display_name="Dense last steps", default=0,
                              min=0, max=16, tooltip="Force the last N sampler steps dense."),
                 io.Float.Input("start_percent", display_name="Sparse start", default=0.0,
@@ -120,7 +151,10 @@ class CurveAttnSparse(io.ComfyNode):
             start_percent=start_percent, end_percent=end_percent, extra_tokens=extra_tokens,
             tail=tail, protect_audio=protect_audio, protect_prefix=protect_prefix,
             disable_fp16_accum=disable_fp16_accum, dense_backend=dense_backend,
-            qkv_mode=qkv_mode, verbose=verbose))
+            qkv_mode=qkv_mode, verbose=verbose,
+            reblock_summary=selection.get("reblock_summary", "pooled"),
+            reblock_updates=selection.get("reblock_updates", 1),
+            reblock_refresh=selection.get("reblock_refresh", 2)))
 
 
 def _manual_inputs():

@@ -45,12 +45,14 @@ from .common import (
     schedule_progress, schedule_tuple,
 )
 from .sol_attn import check_prepared_available, consume_sla, prepare_sla, sol_attn_zerocopy
+from .reblock import (SUMMARIES, build_reblock_plan, gather_heads, reweighted_attention,
+                      scatter_heads, video_span)
 from .vsa import (build_vsa_plan, gather_qkv, has_gate, make_vsa_gate_attention, scatter_rows,
                   take_gate)
 
 WHO = f"{PREFIX} Sparse"
 _HEAD_DIM = 128
-SELECTIONS = ("sla", "sol-attn", "vsa")
+SELECTIONS = ("sla", "sol-attn", "vsa", "reblock")
 DENSE_BACKENDS = ("comfy_kitchen_int8", "pytorch")
 QKV_MODES = ("native", "owned_bf16", "chunked")
 VSA_PLAN_CACHE = 4
@@ -60,7 +62,8 @@ VSA_PLAN_CACHE = 4
 
 def validate_sparse(*, selection, keep_percent, keep_percent_end, tau, tau_end,
                     min_tokens, dense_last_steps, start_percent, end_percent,
-                    extra_tokens, dense_backend, qkv_mode):
+                    extra_tokens, dense_backend, qkv_mode, reblock_summary="pooled",
+                    reblock_updates=1, reblock_refresh=2):
     def real(name, value, low, high):
         if isinstance(value, bool) or not isfinite(float(value)) or not low <= float(value) <= high:
             raise ValueError(f"{WHO}: invalid {name}")
@@ -90,6 +93,10 @@ def validate_sparse(*, selection, keep_percent, keep_percent_end, tau, tau_end,
         raise ValueError(f"{WHO}: invalid dense_backend")
     if qkv_mode not in QKV_MODES:
         raise ValueError(f"{WHO}: invalid qkv_mode")
+    if reblock_summary not in SUMMARIES:
+        raise ValueError(f"{WHO}: invalid reblock summary")
+    integer("reblock_updates", reblock_updates, 0, 4)
+    integer("reblock_refresh", reblock_refresh, 1, 8)
 
 
 # ---------------------------------------------------------------- state
@@ -120,7 +127,8 @@ class SparseState:
                  dense_steps=frozenset(), dense_last_steps=0, tail=False, token_aug=0,
                  protect_audio=False, protect_prefix=False, disable_fp16_accum=True,
                  sigma_start=None, sigma_end=None, dense_backend="comfy_kitchen_int8",
-                 qkv_mode="native", prepared_available=False, verbose=False):
+                 qkv_mode="native", prepared_available=False, verbose=False,
+                 reblock_summary="pooled", reblock_updates=1, reblock_refresh=2):
         self.seq = next_seq()
         self.uid = f"sparse{self.seq}"
         self.dense_attention = dense_attention
@@ -149,6 +157,10 @@ class SparseState:
         self._vsa_last = None             # (weakref(layout), device, plan) fast path
         self._vsa_rope = None             # (weakref(rope_freqs), plan, permuted)
         self.vsa_gate = False
+        self.reblock_summary = reblock_summary
+        self.reblock_updates = int(reblock_updates)
+        self.reblock_refresh = int(reblock_refresh)
+        self.reblock_plans = {}
         self.lock = Lock()
         self.reset()
 
@@ -158,6 +170,10 @@ class SparseState:
         self.dense_calls = 0
         self.chunked_calls = 0
         self.failure_reason = None
+        self.reweight_failed = None
+        self.reblock_paths = {}
+        self.reblock_timing = {}
+        self.reblock_plans = {}
         self.prepared_enabled = self.prepared_available
         self.last_reason = None
 
@@ -307,6 +323,25 @@ class SparseState:
         if self.sparse_calls == 0 and self.dense_calls and not self.failure_reason:
             LOG.warning("%s [%s]: sparse was requested but sparse_calls=0 (last_dense=%s)",
                         WHO, self.uid, self.last_reason)
+        if self.reblock_paths:
+            LOG.info("%s [%s]: reblock paths %s", WHO, self.uid,
+                     " ".join(f"{k}={v}" for k, v in sorted(self.reblock_paths.items())))
+        for step in sorted(self.reblock_timing):
+            self._log_reblock_step(step)
+
+    def _log_reblock_step(self, step):
+        calls, plan_ms, attn_ms, paths = self.reblock_timing.pop(step)
+        LOG.info("%s [%s]: reblock step %d: %d calls plan %.0f ms attention %.0f ms path %s",
+                 WHO, self.uid, step, calls, plan_ms, attn_ms, "/".join(sorted(paths)))
+
+    def time_reblock(self, step, plan_ms, attn_ms, path):
+        for old in [s for s in self.reblock_timing if s != step]:
+            self._log_reblock_step(old)
+        row = self.reblock_timing.setdefault(step, [0, 0.0, 0.0, set()])
+        row[0] += 1
+        row[1] += plan_ms
+        row[2] += attn_ms
+        row[3].add(path)
 
     def cleanup(self):
         self.schedule = ()
@@ -314,7 +349,11 @@ class SparseState:
         self._vsa_plans.clear()
         self._vsa_last = None
         self._vsa_rope = None
-        self.reset()
+        # ComfyUI's outer_sample runs model_patcher.cleanup() (ON_CLEANUP) *inside* our
+        # OUTER_SAMPLE wrapper, before report(); resetting then zeroed every count.
+        # outer() resets at the start of each run anyway.
+        if not self.lock.locked():
+            self.reset()
 
 
 def namespace_of(options) -> dict:
@@ -461,6 +500,107 @@ def _run_native_sparse(state, q, k, v, qs, ks, vs, heads, skip_output_reshape,
     return out.reshape(b, -1, heads * dim_head)
 
 
+def _step_of(decision):
+    step = getattr(decision, "step", None)
+    return -1 if step is None else int(step)
+
+
+def _reblock_plan(state, qs, ks, span, decision, options):
+    """Build the plan, or reuse this layer's plan for ``reblock_refresh`` steps.
+
+    Keyed by block index, cond/uncond mix, shape and span; ``reset()`` (new run)
+    drops the cache. Routing still runs per call inside sol_attn."""
+    refresh = state.reblock_refresh
+    block = options.get("block_index")
+    step = _step_of(decision)
+    if refresh <= 1 or block is None or step < 0:
+        return build_reblock_plan(qs, ks, span, updates=state.reblock_updates)
+    key = (block, tuple(options.get("cond_or_uncond") or ()), tuple(qs.shape), span,
+           str(qs.device))
+    hit = state.reblock_plans.get(key)
+    if hit is not None and 0 <= step - hit[0] < refresh:
+        return hit[1]
+    plan = build_reblock_plan(qs, ks, span, updates=state.reblock_updates)
+    state.reblock_plans[key] = (step, plan)
+    return plan
+
+
+def _run_reblock(state, q, k, v, qs, ks, vs, heads, skip_output_reshape, b, dim_head,
+                 decision, scale, layout, owned, dense, options=None):
+    options = options or {}
+    """Reblocked selection: per-head clustered order, then flex (reweighted tail)
+    or Kitchen sol_attn (pooled / no tail) on that order."""
+    span = video_span(layout, qs.shape[1])
+    if span is None:
+        return dense("H3 layout unavailable for reblock")
+    input_dtype = qs.dtype
+    if input_dtype != torch.bfloat16:
+        qs, ks, vs = (t.to(torch.bfloat16) for t in (qs, ks, vs))
+    timing = state.verbose and qs.is_cuda
+    if timing:
+        events = [torch.cuda.Event(enable_timing=True) for _ in range(3)]
+        events[0].record()
+    plan = _reblock_plan(state, qs, ks, span, decision, options)
+    if timing:
+        events[1].record()
+    if plan is None:
+        return dense("target video too short for reblock")
+    qs, ks, vs = gather_heads(qs, ks, vs, plan["src"], plan["dead"])
+    ratio = float(decision.topk)
+    summary = state.reblock_summary
+    if summary == "reweighted" and state.reweight_failed is not None:
+        summary = "pooled"
+    out = None
+    try:
+        if summary == "reweighted":
+            try:
+                out = reweighted_attention(qs, ks, vs, plan, ratio, scale)
+            except torch.OutOfMemoryError:
+                raise
+            except Exception as exc:  # flex/compile failures are not device faults
+                if is_fatal_device_error(exc):
+                    raise
+                state.reweight_failed = f"{type(exc).__name__}: {exc}"
+                LOG.warning("%s: reweighted tail unavailable (%s); using the pooled "
+                            "sol_attn tail for this run", WHO, state.reweight_failed)
+                summary = "pooled"
+        if out is None:
+            sink = [0, plan["n_prefix"]]
+            out = sol_attn_zerocopy(qs, ks, vs, topk_ratio=ratio, tau=0.0, scale=scale,
+                                    sink_blocks=sink, sink_q=sink, tail=summary == "pooled",
+                                    token_aug=0, block_len=plan["block_len"])
+    except torch.OutOfMemoryError:
+        raise
+    except (RuntimeError, ValueError, NotImplementedError) as exc:
+        if is_fatal_device_error(exc):
+            raise
+        state.failure_reason = f"sol_attn failed: {exc}"
+        LOG.warning("%s: %s; using dense for this run", WHO, state.failure_reason)
+        return dense(state.failure_reason)
+    del qs, ks, vs
+    out = scatter_heads(out, plan["inv"])
+    state.reblock_paths[summary] = state.reblock_paths.get(summary, 0) + 1
+    if timing:
+        events[2].record()
+        events[2].synchronize()
+        state.time_reblock(_step_of(decision), events[0].elapsed_time(events[1]),
+                           events[1].elapsed_time(events[2]),
+                           "flex" if summary == "reweighted" else f"sol-{summary}")
+    if owned:
+        for container in (q, k, v):
+            container.take()
+    if input_dtype != torch.bfloat16:
+        out = out.to(input_dtype)
+    state.sparse_calls += 1
+    state.info_once(("reblock", plan["n"], plan["n_prefix"], summary),
+                    "reblock: %d rows, %d prefix tiles, %d video blocks, keep %.1f%%, tail %s"
+                    % (plan["n"], plan["n_prefix"], plan["n_video_blocks"], 100.0 * ratio,
+                       summary))
+    if skip_output_reshape:
+        return out.transpose(1, 2)
+    return out.reshape(b, -1, heads * dim_head)
+
+
 def make_attention_override(state: SparseState, previous=None):
     def override(func, q, k, v, heads, mask=None, attn_precision=None,
                  skip_reshape=False, skip_output_reshape=False, **kwargs):
@@ -494,6 +634,11 @@ def make_attention_override(state: SparseState, previous=None):
         reason = _ineligible(qs, ks, vs, dim_head)
         if reason is not None:
             return dense(reason)
+        if state.selection == "reblock":
+            return _run_reblock(state, q, k, v, qs, ks, vs, heads, skip_output_reshape, b,
+                                dim_head, decision, kwargs.get("scale"),
+                                transformer_options.get("minimax_h3_layout"), owned, dense,
+                                transformer_options)
         sinks = h3_sinks(transformer_options, tokens, state.protect_audio, state.protect_prefix)
         if sinks is None:
             return dense("H3 layout unavailable for requested protection")
@@ -643,20 +788,24 @@ def apply_sparse(model, *, selection="sla", keep_percent=20.0, keep_percent_end=
                  dense_last_steps=0, start_percent=0.0, end_percent=1.0, extra_tokens=0,
                  tail=False, protect_audio=False, protect_prefix=False,
                  disable_fp16_accum=True, dense_backend="comfy_kitchen_int8",
-                 qkv_mode="native", verbose=False):
+                 qkv_mode="native", verbose=False, reblock_summary="pooled",
+                 reblock_updates=1, reblock_refresh=2):
     selection = str(selection or "sla")
     validate_sparse(selection=selection, keep_percent=keep_percent,
                     keep_percent_end=keep_percent_end, tau=tau, tau_end=tau_end,
                     min_tokens=min_tokens, dense_last_steps=dense_last_steps,
                     start_percent=start_percent, end_percent=end_percent,
-                    extra_tokens=extra_tokens, dense_backend=dense_backend, qkv_mode=qkv_mode)
+                    extra_tokens=extra_tokens, dense_backend=dense_backend, qkv_mode=qkv_mode,
+                    reblock_summary=reblock_summary, reblock_updates=reblock_updates,
+                    reblock_refresh=reblock_refresh)
     steps = parse_steps(dense_steps)
     diffusion_model = require_h3(model, WHO)
     check_object_patches(model, WHO)
     blocks.check_dit(model.model_options, WHO)
     check_override_slot(model.model_options.get("transformer_options"))
     cache = blocks.current_cache(model.model_options)
-    if cache is not None and cache.span == "whole" and qkv_mode != "native":
+    if cache is not None and cache.span == "whole" and qkv_mode != "native" \
+            and selection != "reblock":
         raise ValueError(f"{WHO}: whole-span CurveAttn Cache requires native qkv_mode")
     if not ck.sol_attn_is_available():
         raise RuntimeError(f"{WHO}: Comfy Kitchen sol_attn is not available on this GPU.")
@@ -683,6 +832,19 @@ def apply_sparse(model, *, selection="sla", keep_percent=20.0, keep_percent_end=
         extra_tokens = 0
         protect_audio = False
         protect_prefix = False
+    if selection == "reblock":
+        if tail or extra_tokens or protect_audio or protect_prefix:
+            LOG.info("%s: reblock ignores tail, extra tokens, and protect toggles; "
+                     "conditioning rows stay dense and exact", WHO)
+        if qkv_mode != "native":
+            LOG.info("%s: reblock orders rows from the whole K; qkv_mode=%s runs as native",
+                     WHO, qkv_mode)
+        tail = False
+        extra_tokens = 0
+        protect_audio = False
+        protect_prefix = False
+        qkv_mode = "native"
+        prepared_available = False
     keep_ratio_end = (float(keep_percent_end) / 100.0
                       if float(keep_percent_end) >= 0.5 and selection == "sla" else None)
     scheduled_tau_end = (float(tau_end)
@@ -696,7 +858,9 @@ def apply_sparse(model, *, selection="sla", keep_percent=20.0, keep_percent_end=
         token_aug=int(extra_tokens), protect_audio=bool(protect_audio),
         protect_prefix=bool(protect_prefix), disable_fp16_accum=bool(disable_fp16_accum),
         sigma_start=sigma_start, sigma_end=sigma_end, dense_backend=dense_backend,
-        qkv_mode=qkv_mode, prepared_available=prepared_available, verbose=bool(verbose))
+        qkv_mode=qkv_mode, prepared_available=prepared_available, verbose=bool(verbose),
+        reblock_summary=reblock_summary, reblock_updates=int(reblock_updates),
+        reblock_refresh=int(reblock_refresh))
 
     state.vsa_gate = vsa_gate
     m = model.clone()
@@ -722,13 +886,13 @@ def apply_sparse(model, *, selection="sla", keep_percent=20.0, keep_percent_end=
     LOG.info(
         "%s %s [%s]: selection=%s keep=%.1f%% keep_end=%.1f tau=%.3f tau_end=%.3f "
         "extra_tokens=%d start_percent=%.3f end_percent=%.3f sigma_start=%s sigma_end=%s "
-        "qkv_mode=%s prepared_qkv=%s dense_backend=%s dense_steps=%s dense_last_steps=%d "
+        "qkv_mode=%s prepared_qkv=%s dense_backend=%s dense_steps=%s dense_last_steps=%d verbose=%s "
         "protect_prefix=%s protect_audio=%s tail=%s disable_fp16_accum=%s vsa_gate=%s stack=%s",
         WHO, VERSION, state.uid, selection, float(keep_percent), float(keep_percent_end),
         float(tau), float(tau_end), int(extra_tokens), float(start_percent), float(end_percent),
         None if sigma_start is None else f"{sigma_start:.6g}",
         None if sigma_end is None else f"{sigma_end:.6g}",
-        qkv_mode, state.prepared_enabled, dense_backend, sorted(steps), state.dense_last_steps,
+        qkv_mode, state.prepared_enabled, dense_backend, sorted(steps), state.dense_last_steps, state.verbose,
         state.protect_prefix, state.protect_audio, state.tail, state.disable_fp16_accum, vsa_gate,
         stacked)
     return m

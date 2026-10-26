@@ -122,8 +122,8 @@ class StackingTests(unittest.TestCase):
 
     def test_all_dense_step_reaches_the_bottom_dense_backend_once(self):
         with kitchen() as backend:
-            first = sp.apply_sparse(h3_patcher(), dense_steps="0")
-            second = sp.apply_sparse(first, dense_steps="0")
+            first = sp.apply_sparse(h3_patcher(), dense_steps="0-0")
+            second = sp.apply_sparse(first, dense_steps="0-0")
         top = options(second)[OVERRIDE]
         a, b = top._curve_previous._curve_state, top._curve_state
         to = {"sample_sigmas": SCHEDULE, "sigmas": SCHEDULE[0]}
